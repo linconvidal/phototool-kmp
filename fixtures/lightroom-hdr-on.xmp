@@ -1,0 +1,26 @@
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+   xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+   xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+   xmlns:custom="https://example.test/preserve/"
+   xmp:Rating="3"
+   crs:Exposure2012="0.00"
+   crs:WhiteBalance="As Shot"
+   crs:HDREditMode="1"
+   crs:HDRMaxValue="+4.00"
+   crs:SDRBrightness="-20"
+   crs:SDRContrast="+73"
+   crs:SDRClarity="-24"
+   crs:SDRHighlights="+11"
+   crs:SDRShadows="-2"
+   crs:SDRWhites="+17"
+   crs:SDRBlend="0"
+   crs:CameraProfile="Camera CLASSIC CHROME"
+   crs:CameraProfileDigest="A534F9C5F32E988C21A687A4FD5FA5BB"
+   custom:keep="unchanged">
+   <!--preserve-hdr-comment-->
+   <custom:payload>preserve me</custom:payload>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
