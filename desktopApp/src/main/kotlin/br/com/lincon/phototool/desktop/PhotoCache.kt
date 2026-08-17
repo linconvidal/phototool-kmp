@@ -7,35 +7,44 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.sql.Connection
 import java.sql.DriverManager
 
-private const val CACHE_SCHEMA = "2"
+private const val CACHE_SCHEMA = "4"
 private const val MAX_CACHE_PHOTOS = 100_000
 private const val MAX_CACHE_KEYWORDS = 1_000_000
-private const val MAX_CACHED_MEDIA_BYTES = 1024L * 1024 * 1024
+private val CACHE_GENERATION_PATTERN = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+private data class CachedSnapshot(val photos: List<Photo>, val generation: String)
 
 class PhotoCache(private val cacheDir: Path, private val library: Path) {
     private val realLibrary = library.toRealPath()
     private val live: Path
     private val libraryIdentity: String
+    @Volatile private var currentGeneration: String? = null
 
     init {
         val projected = cacheDir.toAbsolutePath().normalize()
         require(!projected.startsWith(realLibrary) && !realLibrary.startsWith(projected)) { "Cache must be outside the library" }
+        assertCachePhysicallySeparate(realLibrary, projected, requireCacheExists = false)
         createSecureDirectories(projected)
         require(!Files.isSymbolicLink(projected)) { "Cache directory may not be a link" }
         val realCache = projected.toRealPath()
         require(!realCache.startsWith(realLibrary) && !realLibrary.startsWith(realCache)) { "Cache must be outside the library" }
+        assertCachePhysicallySeparate(realLibrary, realCache, requireCacheExists = true)
         live = realCache.resolve("phototool.sqlite3")
         val attrs = Files.readAttributes(realLibrary, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
         libraryIdentity = "${realLibrary}\u0000${attrs.fileKey()}"
     }
 
-    fun load(): List<Photo> {
+    @Synchronized fun load(): List<Photo> {
         if (sqliteAuxiliaries(live).any { Files.exists(it, LinkOption.NOFOLLOW_LINKS) }) return emptyList()
         if (!safeRegular(live)) return emptyList()
-        return runCatching { loadSnapshot(live) }.getOrElse { emptyList() }
+        val snapshot = runCatching { loadSnapshot(live) }.getOrElse { currentGeneration = null; return emptyList() }
+        currentGeneration = snapshot.generation
+        return snapshot.photos
     }
 
-    private fun loadSnapshot(snapshot: Path): List<Photo> =
+    fun snapshotGeneration(): String? = currentGeneration
+
+    private fun loadSnapshot(snapshot: Path): CachedSnapshot =
             connect(snapshot, readOnly = true).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.executeQuery("PRAGMA quick_check").use { check(it.next() && it.getString(1) == "ok") { "Invalid cache" } }
@@ -43,7 +52,8 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
                     validateSchema(connection)
                     validateRowBounds(connection)
                     val meta = statement.executeQuery("SELECT key,value FROM meta").use { rows -> buildMap { while (rows.next()) put(rows.getString(1), rows.getString(2)) } }
-                    check(meta.keys == setOf("library", "schema", "state") && meta["library"] == libraryIdentity && meta["schema"] == CACHE_SCHEMA && meta["state"] == "complete") { "Wrong or incomplete cache" }
+                    check(meta.keys == setOf("library", "schema", "state", "generation") && meta["library"] == libraryIdentity && meta["schema"] == CACHE_SCHEMA && meta["state"] == "complete") { "Wrong or incomplete cache" }
+                    val generation = meta.getValue("generation").also { check(it.matches(CACHE_GENERATION_PATTERN)) }
                     val keywords = connection.createStatement().use { keywordStatement ->
                         keywordStatement.executeQuery("SELECT photo_id,keyword,keyword_fold,ordinal FROM keywords ORDER BY photo_id,ordinal").use { rows ->
                             buildMap<String, MutableList<String>> { while (rows.next()) {
@@ -53,14 +63,18 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
                             } }
                         }
                     }
-                    statement.executeQuery("SELECT * FROM photos ORDER BY id").use { rows -> buildList { while (rows.next()) add(validateCachedPhoto(rowToPhoto(rows, keywords[rows.getString("id")].orEmpty()))) } }
+                    val validation = ValidationContext()
+                    val photos = statement.executeQuery("SELECT * FROM photos ORDER BY id").use { rows -> buildList { while (rows.next()) add(validateCachedPhoto(rowToPhoto(rows, keywords[rows.getString("id")].orEmpty()), validation)) } }
+                    CachedSnapshot(photos, generation)
                 }
             }
 
+    @Synchronized
     fun publish(photos: List<Photo>) {
         require(photos.size <= MAX_CACHE_PHOTOS && photos.sumOf { it.editorial.keywords.size.toLong() } <= MAX_CACHE_KEYWORDS && photos.map { it.id }.distinct().size == photos.size)
         rejectUnsafeLive()
         val staging = Files.createTempFile(live.parent, ".phototool-", ".staging")
+        val generation = java.util.UUID.randomUUID().toString()
         try {
             connect(staging).use { connection ->
                 connection.autoCommit = false
@@ -72,17 +86,17 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
                         source_key TEXT,source_size INTEGER,source_mtime INTEGER,preview_key TEXT,preview_size INTEGER,preview_mtime INTEGER,
                         captured TEXT,camera TEXT,camera_make TEXT,camera_model TEXT,lens TEXT,focal REAL,aperture REAL,exposure REAL,iso INTEGER,
                         width INTEGER,height INTEGER,lat REAL,lon REAL,metadata_status TEXT NOT NULL,metadata_error TEXT,
-                        flag TEXT NOT NULL,rating INTEGER NOT NULL,label TEXT,writable INTEGER NOT NULL,issue TEXT)""")
+                        flag TEXT NOT NULL,rating INTEGER NOT NULL,label TEXT,good INTEGER,good_error TEXT,writable INTEGER NOT NULL,issue TEXT)""")
                     it.executeUpdate("CREATE TABLE keywords(photo_id TEXT NOT NULL,keyword TEXT NOT NULL,keyword_fold TEXT NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(photo_id,keyword_fold),FOREIGN KEY(photo_id) REFERENCES photos(id) ON DELETE CASCADE)")
                     it.executeUpdate("CREATE INDEX photos_capture ON photos(captured DESC,id)")
                     it.executeUpdate("CREATE INDEX photos_facets ON photos(camera,lens,flag,rating)")
                     it.executeUpdate("CREATE INDEX keywords_exact ON keywords(keyword_fold)")
                 }
                 connection.prepareStatement("INSERT INTO meta VALUES(?,?)").use { insert ->
-                    mapOf("library" to libraryIdentity, "schema" to CACHE_SCHEMA, "state" to "complete").forEach { (key, value) -> insert.setString(1, key); insert.setString(2, value); insert.addBatch() }
+                    mapOf("library" to libraryIdentity, "schema" to CACHE_SCHEMA, "state" to "complete", "generation" to generation).forEach { (key, value) -> insert.setString(1, key); insert.setString(2, value); insert.addBatch() }
                     insert.executeBatch()
                 }
-                connection.prepareStatement("INSERT INTO photos VALUES(${List(33) { "?" }.joinToString()})").use { insert ->
+                connection.prepareStatement("INSERT INTO photos VALUES(${List(35) { "?" }.joinToString()})").use { insert ->
                     photos.forEach { photo -> bindPhoto(insert, photo); insert.addBatch() }
                     insert.executeBatch()
                 }
@@ -96,24 +110,27 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
                 connection.createStatement().use { statement -> statement.executeQuery("PRAGMA quick_check").use { check(it.next() && it.getString(1) == "ok") } }
             }
             forceFile(staging)
-            check(loadSnapshot(staging).size == photos.size) { "Staged snapshot failed strict validation" }
+            check(loadSnapshot(staging).photos.size == photos.size) { "Staged snapshot failed strict validation" }
             rejectUnsafeLive()
             try { Files.move(staging, live, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
             catch (error: AtomicMoveNotSupportedException) { throw IllegalStateException("Atomic cache publication is unavailable", error) }
             forceDirectory(live.parent)
+            currentGeneration = generation
         } finally {
             Files.deleteIfExists(staging)
             sqliteAuxiliaries(staging).forEach { Files.deleteIfExists(it) }
         }
     }
 
+    @Synchronized
     fun updateEditorial(id: String, state: EditorialState) {
         rejectUnsafeLive()
         if (!safeRegular(live)) return
         connect(live).use { connection ->
             connection.autoCommit = false
-            connection.prepareStatement("UPDATE photos SET flag=?,rating=?,label=? WHERE id=?").use {
-                it.setString(1, state.flag.name); it.setInt(2, state.rating); it.setString(3, state.label?.name); it.setString(4, id)
+            connection.prepareStatement("UPDATE photos SET flag=?,rating=?,label=?,good=?,good_error=? WHERE id=?").use {
+                it.setString(1, state.flag.name); it.setInt(2, state.rating); it.setString(3, state.label?.name)
+                it.setObject(4, state.good?.let { good -> if (good) 1 else 0 }); it.setString(5, state.goodError); it.setString(6, id)
                 check(it.executeUpdate() == 1) { "Photo is absent from cache" }
             }
             connection.prepareStatement("DELETE FROM keywords WHERE photo_id=?").use { it.setString(1, id); it.executeUpdate() }
@@ -132,10 +149,10 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
             photo.previewIdentity?.fileKey, photo.previewIdentity?.size, photo.previewIdentity?.modifiedMillis,
             m.capturedAt, m.cameraDisplay, m.cameraMake, m.cameraModel, m.lens, m.focalLength, m.aperture, m.exposureSeconds, m.iso,
             m.width, m.height, m.latitude, m.longitude, m.status.name, m.errorCode,
-            photo.editorial.flag.name, photo.editorial.rating, photo.editorial.label?.name, if (photo.writable) 1 else 0, photo.issue)
-        check(values.size == 33)
+            photo.editorial.flag.name, photo.editorial.rating, photo.editorial.label?.name, photo.editorial.good?.let { if (it) 1 else 0 }, photo.editorial.goodError, if (photo.writable) 1 else 0, photo.issue)
+        check(values.size == 35)
         values.forEachIndexed { index, value -> insert.setObject(index + 1, value) }
-        // The schema currently has 33 columns. Keep this assertion adjacent to binding.
+        // Keep the schema column count assertion adjacent to binding.
     }
 
     private fun rowToPhoto(r: java.sql.ResultSet, keywords: List<String>) = Photo(
@@ -149,7 +166,7 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
             width = r.intOrNull("width"), height = r.intOrNull("height"), latitude = r.number("lat"), longitude = r.number("lon"),
             status = MetadataStatus.valueOf(r.getString("metadata_status")), errorCode = r.getString("metadata_error"),
         ),
-        editorial = EditorialState(Flag.valueOf(r.getString("flag")), r.getInt("rating"), r.getString("label")?.let(ColorLabel::valueOf), keywords),
+        editorial = EditorialState(Flag.valueOf(r.getString("flag")), r.getInt("rating"), r.getString("label")?.let(ColorLabel::valueOf), keywords, r.getObject("good")?.let { (it as Number).toInt() == 1 }, r.getString("good_error")),
         writable = r.getInt("writable") == 1, issue = r.getString("issue"),
     )
 
@@ -173,7 +190,7 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
                 text("source_key"), integer("source_size"), integer("source_mtime"), text("preview_key"), integer("preview_size"), integer("preview_mtime"),
                 text("captured"), text("camera"), text("camera_make"), text("camera_model"), text("lens"), real("focal"), real("aperture"), real("exposure"), integer("iso"),
                 integer("width"), integer("height"), real("lat"), real("lon"), text("metadata_status", true), text("metadata_error"),
-                text("flag", true), integer("rating", true), text("label"), integer("writable", true), text("issue"),
+                text("flag", true), integer("rating", true), text("label"), integer("good"), text("good_error"), integer("writable", true), text("issue"),
             ),
             "keywords" to listOf(text("photo_id", true, 1), text("keyword", true), text("keyword_fold", true, 2), integer("ordinal", true)),
         )
@@ -237,14 +254,14 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
             validText("id", 24, false), validText("folder", 4096, false), validText("stem", 255, false), validText("authority", 4096, false),
             validText("raw", 4096), validText("jpeg", 4096), validText("preview", 4096), validText("source_key", 512), validText("preview_key", 512),
             validText("captured", 64), validText("camera", 512), validText("camera_make", 512), validText("camera_model", 512), validText("lens", 512),
-            validText("metadata_status", 16, false), validText("metadata_error", 160), validText("flag", 16, false), validText("label", 16), validText("issue", 256),
+            validText("metadata_status", 16, false), validText("metadata_error", 160), validText("flag", 16, false), validText("label", 16), validText("good_error", 64), validText("issue", 256),
         ).joinToString(" AND ")
         val numeric = """
-            typeof(source_size)='integer' AND source_size BETWEEN 1 AND $MAX_CACHED_MEDIA_BYTES AND
+            typeof(source_size)='integer' AND source_size>=0 AND
             typeof(source_mtime)='integer' AND source_mtime>=0 AND
-            typeof(preview_size)='integer' AND preview_size BETWEEN 1 AND $MAX_CACHED_MEDIA_BYTES AND
+            typeof(preview_size)='integer' AND preview_size>=0 AND
             typeof(preview_mtime)='integer' AND preview_mtime>=0 AND
-            typeof(rating)='integer' AND rating BETWEEN 0 AND 5 AND typeof(writable)='integer' AND writable IN (0,1) AND
+            typeof(rating)='integer' AND rating BETWEEN 0 AND 5 AND (good IS NULL OR (typeof(good)='integer' AND good IN (0,1))) AND typeof(writable)='integer' AND writable IN (0,1) AND
             (focal IS NULL OR (typeof(focal) IN ('real','integer') AND focal>0 AND focal<=100000)) AND
             (aperture IS NULL OR (typeof(aperture) IN ('real','integer') AND aperture>0 AND aperture<=1024)) AND
             (exposure IS NULL OR (typeof(exposure) IN ('real','integer') AND exposure>0 AND exposure<=86400)) AND
@@ -259,10 +276,10 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
         val keywordText = listOf(validText("photo_id", 24, false), validText("keyword", 160, false), validText("keyword_fold", 160, false)).joinToString(" AND ")
         check(count("SELECT COUNT(*) FROM keywords WHERE NOT ($keywordText AND typeof(ordinal)='integer' AND ordinal BETWEEN 0 AND 255)") == 0L) { "Cache keyword field is outside its domain" }
         check(count("SELECT COUNT(*) FROM meta WHERE NOT (${validText("key", 16, false)} AND ${validText("value", 8192, false, allowNul = true)})") == 0L) { "Cache metadata field is outside its domain" }
-        check(count("SELECT COUNT(*) FROM meta") == 3L)
+        check(count("SELECT COUNT(*) FROM meta") == 4L)
     }
 
-    private fun validateCachedPhoto(photo: Photo): Photo {
+    private fun validateCachedPhoto(photo: Photo, context: ValidationContext): Photo {
         fun relative(value: String): Path {
             val path = Path.of(value)
             check(!path.isAbsolute && path.normalize() == path && path.none { it.toString() in setOf("", ".", "..") })
@@ -277,48 +294,54 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
         val sourcePath = relative(source)
         val authority = relative(photo.authorityPath)
         check(authority.parent == sourcePath.parent && authority.fileName.toString().substringAfterLast('.', "").equals("xmp", true))
-        check(authority.fileName.toString().substringBeforeLast('.').equals(sourcePath.fileName.toString().substringBeforeLast('.'), true))
-        raw?.let { check(relative(it).parent == sourcePath.parent && relative(it).fileName.toString().substringBeforeLast('.').equals(photo.stem, true)) }
-        jpeg?.let { check(relative(it).parent == sourcePath.parent && relative(it).fileName.toString().substringBeforeLast('.').equals(photo.stem, true)) }
+        check(caseFoldText(authority.fileName.toString().substringBeforeLast('.')) == caseFoldText(sourcePath.fileName.toString().substringBeforeLast('.')))
+        raw?.let { check(relative(it).parent == sourcePath.parent && caseFoldText(relative(it).fileName.toString().substringBeforeLast('.')) == caseFoldText(photo.stem)) }
+        jpeg?.let { check(relative(it).parent == sourcePath.parent && caseFoldText(relative(it).fileName.toString().substringBeforeLast('.')) == caseFoldText(photo.stem)) }
         check((sourcePath.parent?.toString()?.replace('\\', '/') ?: "") == photo.folder)
         check(photo.previewPath == (jpeg ?: raw))
         val sourceIdentity = photo.sourceIdentity
         val previewIdentity = photo.previewIdentity
         check(sourceIdentity?.isComplete == true && sourceIdentity.path == source)
         check(previewIdentity?.isComplete == true && previewIdentity.path == photo.previewPath)
-        validateIdentity(sourceIdentity)
-        validateIdentity(previewIdentity)
+        validateIdentity(sourceIdentity, context)
+        validateIdentity(previewIdentity, context)
         check(photo.id == stableId("$source\u0000${photo.authorityPath}"))
         check(photo.editorial.rating in 0..5 && photo.editorial.keywords.size <= 256)
+        val goodError = photo.editorial.goodError
+        check(goodError == null || (goodError.length <= 64 && goodError.matches(Regex("[a-z0-9-]+"))))
         photo.editorial.keywords.forEach { check(normalizeKeyword(it) == it) }
+        photo.metadata.capturedAt?.let { check(captureGregorianDate(it) != null) }
         val metadataError = photo.metadata.errorCode
         val issue = photo.issue
         check(metadataError == null || (metadataError.length <= 160 && '/' !in metadataError && '\\' !in metadataError))
         check(issue == null || issue.length <= 256)
         val directory = realLibrary.resolve(photo.folder).normalize()
-        check(directory.startsWith(realLibrary) && Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(directory))
-        val names = Files.list(directory).use { stream -> stream.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(it) }.map { it.fileName.toString() }.toList() }
-        val foldedStem = photo.stem.lowercase()
-        val raws = names.filter { classifyMedia(it) == MediaKind.RAW && it.substringBeforeLast('.').lowercase() == foldedStem }.toSet()
-        val jpegs = names.filter { classifyMedia(it) == MediaKind.JPEG && it.substringBeforeLast('.').lowercase() == foldedStem }.toSet()
+        check(directory.startsWith(realLibrary))
+        val directoryAttrs = context.attributes(directory)
+        check(directoryAttrs != null && directoryAttrs.isDirectory && !directoryAttrs.isSymbolicLink)
+        val names = context.listing(directory)
+        val foldedStem = caseFoldText(photo.stem)
+        val raws = names.filter { classifyMedia(it) == MediaKind.RAW && caseFoldText(it.substringBeforeLast('.')) == foldedStem }.toSet()
+        val jpegs = names.filter { classifyMedia(it) == MediaKind.JPEG && caseFoldText(it.substringBeforeLast('.')) == foldedStem }.toSet()
         val indexedRaws = setOfNotNull(raw?.let { Path.of(it).fileName.toString() })
         val indexedJpegs = setOfNotNull(jpeg?.let { Path.of(it).fileName.toString() })
-        val canonicals = names.filter { it.substringAfterLast('.', "").equals("xmp", true) && it.substringBeforeLast('.').lowercase() == foldedStem }
-        val legacy = names.any { val inner = it.substringBeforeLast('.', ""); it.substringAfterLast('.', "").equals("xmp", true) && classifyMedia(inner) != null && inner.substringBeforeLast('.').lowercase() == foldedStem }
+        val canonicals = names.filter { it.substringAfterLast('.', "").equals("xmp", true) && caseFoldText(it.substringBeforeLast('.')) == foldedStem }
+        val legacy = names.any { val inner = it.substringBeforeLast('.', ""); it.substringAfterLast('.', "").equals("xmp", true) && classifyMedia(inner) != null && caseFoldText(inner.substringBeforeLast('.')) == foldedStem }
         val topologyWritable = raws == indexedRaws && jpegs == indexedJpegs && canonicals.size <= 1 && (canonicals.isEmpty() || canonicals.single() == authority.fileName.toString()) && !legacy
         check(!photo.writable || topologyWritable)
         return photo
     }
 
-    private fun validateIdentity(identity: MediaIdentity) {
+    private fun validateIdentity(identity: MediaIdentity, context: ValidationContext) {
         val path = realLibrary.resolve(identity.path).normalize()
-        check(path.startsWith(realLibrary) && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(path))
-        val attrs = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        check(path.startsWith(realLibrary))
+        val attrs = context.attributes(path) ?: throw IllegalStateException("Cached media identity could not be inspected")
+        check(attrs.isRegularFile && !attrs.isSymbolicLink)
         val key = attrs.fileKey()?.toString() ?: throw IllegalStateException("Stable cache identity unavailable")
         check(key == identity.fileKey && attrs.size() == identity.size && attrs.lastModifiedTime().toMillis() == identity.modifiedMillis)
     }
 
-    private fun stableId(value: String): String = java.security.MessageDigest.getInstance("SHA-256").digest(value.lowercase().toByteArray()).take(12).joinToString("") { "%02x".format(it) }
+    private fun stableId(value: String): String = java.security.MessageDigest.getInstance("SHA-256").digest(caseFoldText(value).toByteArray()).take(12).joinToString("") { "%02x".format(it) }
 
     private fun connect(path: Path, readOnly: Boolean = false): Connection {
         val url = if (readOnly) "jdbc:sqlite:file:${path.toAbsolutePath()}?mode=ro&nofollow=true" else "jdbc:sqlite:${path.toAbsolutePath()}"
@@ -333,7 +356,7 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
     private fun sqliteAuxiliaries(path: Path) = listOf("-journal", "-wal", "-shm").map { Path.of(path.toString() + it) }
     private fun safeRegular(path: Path): Boolean = Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(path) && runCatching { (Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS) as Number).toInt() == 1 }.getOrDefault(false)
     private fun forceFile(path: Path) = FileChannel.open(path, StandardOpenOption.READ).use { it.force(true) }
-    private fun forceDirectory(path: Path) { runCatching { FileChannel.open(path, StandardOpenOption.READ).use { it.force(true) } } }
+    private fun forceDirectory(path: Path) { FileChannel.open(path, StandardOpenOption.READ).use { it.force(true) } }
 
     private fun createSecureDirectories(path: Path) {
         var current = path.root ?: error("Cache path must be absolute")
@@ -342,5 +365,152 @@ class PhotoCache(private val cacheDir: Path, private val library: Path) {
             if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) require(Files.isDirectory(current, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(current)) { "Cache path contains a link" }
             else Files.createDirectory(current)
         }
+    }
+}
+
+internal fun decodeMountPoint(raw: String): String = buildString {
+    var i = 0
+    while (i < raw.length) {
+        val c = raw[i]
+        if (c == '\\' && i + 4 <= raw.length) {
+            val octal = raw.substring(i + 1, i + 4)
+            try { append(octal.toInt(8).toChar()); i += 4 } catch (_: Exception) { append(c); i++ }
+        } else { append(c); i++ }
+    }
+}
+
+/** Returns true if any mount point under the library path has the same device as the
+ * cache parent mount. Reads /proc/self/mountinfo; fails closed on error. */
+private fun mountinfoCacheDeviceInsideLibrary(library: Path, absoluteCache: Path): Boolean {
+    val mountLines = try { Files.readAllLines(Path.of("/proc/self/mountinfo")) } catch (_: Exception) { return false }
+    val cachePath = absoluteCache.normalize().toString()
+    val libraryPath = library.toRealPath().toString()
+    // Find the device of the deepest mount that contains the cache path
+    data class MountDevice(val device: String, val depth: Int)
+    val cacheMountDevice = mountLines.mapNotNull { line ->
+        val fields = line.split(" ")
+        if (fields.size < 5) return@mapNotNull null
+        val mountPoint = decodeMountPoint(fields[4])
+        if (cachePath.startsWith(mountPoint)) MountDevice(fields[2], mountPoint.length) else null
+    }.maxByOrNull { it.depth }?.device ?: return false
+    // Check if any mount inside the library has the same device
+    return mountLines.any { line ->
+        val fields = line.split(" ")
+        fields.size >= 5 && fields[2] == cacheMountDevice && decodeMountPoint(fields[4]).let { mp ->
+            mp.startsWith(libraryPath) && (mp.length == libraryPath.length || mp[libraryPath.length] == '/')
+        }
+    }
+}
+
+/**
+ * Memoizes directory listings and attribute reads for one cache validation pass so
+ * publication stays linear in the number of distinct folders and files instead of
+ * re-listing a shared folder once per photo.
+ */
+private class ValidationContext {
+    private val listings = HashMap<Path, List<String>>()
+    private val attributes = HashMap<Path, BasicFileAttributes?>()
+
+    fun listing(directory: Path): List<String> = listings.getOrPut(directory) {
+        Files.list(directory).use { stream -> stream.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(it) }.map { it.fileName.toString() }.toList() }
+    }
+
+    fun attributes(path: Path): BasicFileAttributes? {
+        if (attributes.containsKey(path)) return attributes.getValue(path)
+        val attrs = runCatching { Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS) }.getOrNull()
+        attributes[path] = attrs
+        return attrs
+    }
+}
+
+/**
+ * Rejects lexical aliases and detectable bind/physical aliases. Every existing cache
+ * ancestor is compared with the library root, and every library ancestor is compared
+ * with the cache root. `isSameFile` is backed by device/inode identity on the desktop
+ * filesystems we support; stable file keys and FileStore access are required as an
+ * additional fail-closed capability check.
+ */
+internal fun assertCachePhysicallySeparate(
+    library: Path,
+    cache: Path,
+    requireCacheExists: Boolean,
+    allowCacheAncestorOfLibrary: Boolean = false,
+) {
+    val realLibrary = library.toRealPath()
+    val absoluteCache = cache.toAbsolutePath().normalize()
+    require(!absoluteCache.startsWith(realLibrary) && (allowCacheAncestorOfLibrary || !realLibrary.startsWith(absoluteCache))) {
+        "Cache must be outside the library"
+    }
+
+    fun existingAncestors(start: Path): List<Path> = buildList {
+        var current: Path? = start
+        while (current != null) {
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) add(current)
+            current = current.parent
+        }
+    }
+    data class PhysicalIdentity(val fileKey: String, val device: String?, val storeName: String, val storeType: String)
+    fun stableIdentity(path: Path): PhysicalIdentity {
+        val attrs = Files.readAttributes(path, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        val key = attrs.fileKey()?.toString() ?: error("Stable physical path identity is unavailable")
+        val store = Files.getFileStore(path)
+        val device = runCatching { Files.getAttribute(path, "unix:dev", LinkOption.NOFOLLOW_LINKS).toString() }.getOrNull()
+        return PhysicalIdentity(key, device, store.name(), store.type())
+    }
+    fun sameIdentity(left: PhysicalIdentity, right: PhysicalIdentity): Boolean =
+        left.fileKey == right.fileKey &&
+            ((left.device != null && left.device == right.device) ||
+                (left.device == null && right.device == null && left.storeName == right.storeName && left.storeType == right.storeType))
+    fun same(left: Path, right: Path): Boolean = try {
+        Files.isSameFile(left, right) || sameIdentity(stableIdentity(left), stableIdentity(right))
+    } catch (error: Exception) { throw IllegalStateException("Could not prove cache separation", error) }
+
+    val libraryIdentity = stableIdentity(realLibrary)
+    val cacheRoot = if (requireCacheExists) absoluteCache.toRealPath() else existingAncestors(absoluteCache).firstOrNull()
+        ?: throw IllegalStateException("No existing cache ancestor can be identified")
+    val rootIdentity = stableIdentity(cacheRoot)
+    val cacheAncestors = existingAncestors(absoluteCache).map { ancestor ->
+        require(Files.isDirectory(ancestor, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(ancestor)) { "Cache ancestry contains a non-directory or link" }
+        ancestor to stableIdentity(ancestor)
+    }
+    cacheAncestors.forEach { (ancestor, _) ->
+        require(!same(ancestor, realLibrary)) { "Cache physically aliases the library" }
+    }
+
+    // Fast path: different filesystems cannot alias through file-level operations
+    // (hardlinks, renames, symlinks). A bind mount of the cache's filesystem into the
+    // library is caught by mountinfo, and the reverse (library bind-mounted onto the
+    // cache) would make the device equal, falling through to the full walk.
+    if (libraryIdentity.device != null && rootIdentity.device != null && libraryIdentity.device != rootIdentity.device) {
+        if (mountinfoCacheDeviceInsideLibrary(realLibrary, absoluteCache)) {
+            throw IllegalStateException("Cache filesystem is bind-mounted inside the library")
+        }
+        return
+    }
+
+    // A bind mount can expose library/subdir as an unrelated-looking cache root (or
+    // expose the cache as a library descendant). Walking directory identities without
+    // following symlinks detects both directions. Refuse excessive or unreadable trees
+    // rather than weakening the proof.
+    var directories = 0
+    try {
+        Files.walkFileTree(realLibrary, setOf(), Int.MAX_VALUE, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                require(!attrs.isSymbolicLink && attrs.isDirectory)
+                directories++
+                require(directories <= 200_000) { "Library has too many directories to prove cache separation" }
+                val identity = stableIdentity(dir)
+                cacheAncestors.forEach { (_, cacheIdentity) ->
+                    require(!sameIdentity(identity, cacheIdentity)) { "Cache physically aliases a library descendant" }
+                }
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFileFailed(file: Path, error: java.io.IOException): FileVisitResult =
+                throw IllegalStateException("Could not inspect library directory topology", error)
+        })
+    } catch (error: Exception) {
+        if (error is IllegalArgumentException || error is IllegalStateException) throw error
+        throw IllegalStateException("Could not prove cache separation from library descendants", error)
     }
 }

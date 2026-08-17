@@ -3,14 +3,14 @@ package br.com.lincon.phototool.desktop
 import br.com.lincon.phototool.domain.Photo
 import br.com.lincon.phototool.domain.classifyMedia
 import br.com.lincon.phototool.ui.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.*
-import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
 
@@ -41,6 +41,7 @@ data class FujiRecipe(
     val lensModulation: Boolean,
     val version: String,
 )
+internal data class FujiContentSnapshot(val recipe: FujiRecipe, val relativePath: String, val digest: String)
 
 class FujiProfileDocument(private val original: ByteArray, private val kind: String) {
     private val bom = original.startsWith(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
@@ -120,62 +121,79 @@ class FujiProfileDocument(private val original: ByteArray, private val kind: Str
 
 class FujiProfileStore(private val root: Path, private val writeEnabled: Boolean) : AutoCloseable {
     private val realRoot = root.toRealPath()
-    private val secure = if (writeEnabled) SecureLibraryBoundary(realRoot, true) else null
-    private val locks = ConcurrentHashMap<String, Any>()
+    private val secure = SecureLibraryBoundary(realRoot, writeEnabled)
 
-    fun read(photo: Photo): FujiRecipe? {
+    internal fun <T> withPhotoLock(photo: Photo, block: () -> T): T =
+        EditorialPhotoLocks.withLock(realRoot, photo, block)
+
+    fun read(photo: Photo): FujiRecipe? = readSnapshot(photo)?.recipe
+
+    internal fun readSnapshot(photo: Photo): FujiContentSnapshot? = withPhotoLock(photo) {
         val profiles = locate(photo)
-        val selected = profiles.first ?: profiles.second ?: return null
-        return FujiProfileDocument(readBounded(selected), selected.extension).recipe()
+        val selected = profiles.first ?: profiles.second ?: return@withPhotoLock null
+        val relative = realRoot.relativize(selected).toString().replace('\\', '/')
+        val bytes = secure.read(relative, MAX_FUJI_BYTES)
+        FujiContentSnapshot(FujiProfileDocument(bytes, selected.extension).recipe(), relative, digestHex(bytes))
     }
 
-    fun mutate(photo: Photo, updates: Map<String, String>): FujiRecipe {
+    internal fun confirmSnapshot(photo: Photo, snapshot: FujiContentSnapshot): Boolean = withPhotoLock(photo) {
+        val profiles = locate(photo, validateXmpTopology = false)
+        val selected = profiles.first ?: profiles.second ?: return@withPhotoLock false
+        val relative = realRoot.relativize(selected).toString().replace('\\', '/')
+        relative == snapshot.relativePath && digestHex(secure.read(relative, MAX_FUJI_BYTES)) == snapshot.digest
+    }
+
+    fun mutate(photo: Photo, updates: Map<String, String>, sourceStillCurrent: (() -> Boolean)? = null): FujiRecipe {
         check(writeEnabled && photo.writable)
-        return synchronized(locks.computeIfAbsent(photo.id) { Any() }) {
+        return withPhotoLock(photo) {
             val fp2 = locate(photo).first ?: error("An existing exact-stem FP2 profile is required")
             val relativeFp2 = realRoot.relativize(fp2).toString().replace('\\', '/')
-            val original = secure!!.read(relativeFp2, MAX_FUJI_BYTES)
+            val expectedEntry = secure.expectation(relativeFp2) ?: error("FP2 disappeared")
+            val original = secure.read(relativeFp2, MAX_FUJI_BYTES)
             val document = FujiProfileDocument(original, "FP2")
             val updated = document.update(updates)
-            if (updated.contentEquals(original)) return@synchronized document.recipe()
+            if (updated.contentEquals(original)) return@withPhotoLock document.recipe()
             FujiProfileDocument(updated, "FP2")
             if (!secure.read(relativeFp2, MAX_FUJI_BYTES).contentEquals(original)) error("FP2 changed concurrently")
-            secure.publish(relativeFp2, updated, original, "fp2")
+            secure.publish(
+                relativeFp2,
+                updated,
+                original,
+                "fp2",
+                expectedEntry,
+                beforeCommit = {
+                    check(sourceStillCurrent?.invoke() != false) { "Transfer source changed before FP2 publication" }
+                },
+            )
             val installed = secure.read(relativeFp2, MAX_FUJI_BYTES)
             check(installed.contentEquals(updated)) { "Installed FP2 changed before readback" }
             FujiProfileDocument(installed, "FP2").recipe()
         }
     }
 
-    private fun locate(photo: Photo): Pair<Path?, Path?> {
+    private fun locate(photo: Photo, validateXmpTopology: Boolean = true): Pair<Path?, Path?> {
         val raw = photo.rawPath?.takeIf { Path.of(it).extension.equals("raf", true) } ?: return null to null
         validatePhotoIdentity(photo)
         val source = realRoot.resolve(raw).normalize()
         require(source.startsWith(realRoot))
-        val stem = source.fileName.toString().substringBeforeLast('.').lowercase()
+        val stem = br.com.lincon.phototool.domain.caseFoldText(source.fileName.toString().substringBeforeLast('.'))
         val parentRelative = Path.of(raw).parent?.toString()?.replace('\\', '/') ?: ""
         val entryNames: List<String>
         val names: List<String>
-        if (secure != null) {
-            val entries = secure.list(parentRelative)
-            entryNames = entries.map { it.name }
-            names = entries.filter { it.attributes.isRegularFile }.map { it.name }
-        } else {
-            val entries = Files.list(source.parent).use { it.toList() }
-            entryNames = entries.map { it.fileName.toString() }
-            names = entries.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(it) }.map { it.fileName.toString() }
-        }
-        fun candidates(extension: String) = names.filter { it.substringBeforeLast('.').lowercase() == stem && it.substringAfterLast('.', "").equals(extension, true) }
+        val entries = secure.list(parentRelative)
+        entryNames = entries.map { it.name }
+        names = entries.filter { it.attributes.isRegularFile }.map { it.name }
+        fun candidates(extension: String) = names.filter { br.com.lincon.phototool.domain.caseFoldText(it.substringBeforeLast('.')) == stem && it.substringAfterLast('.', "").equals(extension, true) }
         val fp2 = candidates("fp2")
         val fp3 = candidates("fp3")
         require(fp2.size <= 1 && fp3.size <= 1) { "Ambiguous Fuji profile topology" }
         if (fp2.isEmpty() && entryNames.any { isRecoveryArtifact(it, "$stem.fp2") }) error("FP2 recovery artifact requires manual recovery")
-        if (secure != null) {
-            val rawNames = names.filter { classifyMedia(it) == br.com.lincon.phototool.domain.MediaKind.RAW && it.substringBeforeLast('.').lowercase() == stem }.toSet()
-            val jpegNames = names.filter { classifyMedia(it) == br.com.lincon.phototool.domain.MediaKind.JPEG && it.substringBeforeLast('.').lowercase() == stem }.toSet()
-            check(rawNames == setOf(Path.of(photo.rawPath!!).fileName.toString()) && jpegNames == setOfNotNull(photo.jpegPath?.let { Path.of(it).fileName.toString() })) { "Media topology changed" }
-            val xmps = names.filter { it.substringBeforeLast('.').lowercase() == stem && it.substringAfterLast('.', "").equals("xmp", true) }
-            val legacyXmp = names.any { val inner = it.substringBeforeLast('.', ""); it.substringAfterLast('.', "").equals("xmp", true) && classifyMedia(inner) != null && inner.substringBeforeLast('.').lowercase() == stem }
+        val rawNames = names.filter { classifyMedia(it) == br.com.lincon.phototool.domain.MediaKind.RAW && br.com.lincon.phototool.domain.caseFoldText(it.substringBeforeLast('.')) == stem }.toSet()
+        val jpegNames = names.filter { classifyMedia(it) == br.com.lincon.phototool.domain.MediaKind.JPEG && br.com.lincon.phototool.domain.caseFoldText(it.substringBeforeLast('.')) == stem }.toSet()
+        check(rawNames == setOf(Path.of(photo.rawPath!!).fileName.toString()) && jpegNames == setOfNotNull(photo.jpegPath?.let { Path.of(it).fileName.toString() })) { "Media topology changed" }
+        if (validateXmpTopology) {
+            val xmps = names.filter { br.com.lincon.phototool.domain.caseFoldText(it.substringBeforeLast('.')) == stem && it.substringAfterLast('.', "").equals("xmp", true) }
+            val legacyXmp = names.any { val inner = it.substringBeforeLast('.', ""); it.substringAfterLast('.', "").equals("xmp", true) && classifyMedia(inner) != null && br.com.lincon.phototool.domain.caseFoldText(inner.substringBeforeLast('.')) == stem }
             val expectedXmp = Path.of(photo.authorityPath).fileName.toString()
             check(xmps.size <= 1 && (xmps.isEmpty() || xmps.single() == expectedXmp) && !legacyXmp) { "XMP topology changed" }
             if (xmps.isEmpty()) check(entryNames.none { isRecoveryArtifact(it, expectedXmp) }) { "XMP recovery artifact requires manual recovery" }
@@ -185,22 +203,15 @@ class FujiProfileStore(private val root: Path, private val writeEnabled: Boolean
 
     private fun validatePhotoIdentity(photo: Photo) {
         val expected = photo.sourceIdentity ?: error("Missing media identity")
-        val attrs = secure?.attributes(expected.path) ?: Files.readAttributes(realRoot.resolve(expected.path).normalize(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        val attrs = secure.attributes(expected.path) ?: error("Media disappeared")
         val key = attrs.fileKey()?.toString() ?: error("Stable media identity unavailable")
         check(attrs.isRegularFile && key == expected.fileKey && attrs.size() == expected.size && attrs.lastModifiedTime().toMillis() == expected.modifiedMillis) { "Media identity is stale" }
     }
 
-    override fun close() { secure?.close() }
-
-    private fun hardLinks(path: Path): Int = (Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS) as Number).toInt()
-
-    private fun readBounded(path: Path): ByteArray {
-        require(Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(path) && hardLinks(path) == 1)
-        require(Files.size(path) in 1..MAX_FUJI_BYTES.toLong())
-        return Files.readAllBytes(path)
-    }
+    override fun close() { secure.close() }
 
 
+    private fun digestHex(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 }
 
 data class HdrSettings(val enabled: Boolean, val maxValue: String? = null, val controls: Map<String, Int> = emptyMap())
@@ -224,18 +235,104 @@ fun evidencedFujiTransfer(settings: DevelopSettings): Map<String, String> = buil
     require(isNotEmpty()) { "XMP has no evidenced Fuji-compatible fields" }
 }
 
-class DesktopAuxiliaryActions(private val xmp: XmpSidecarStore, private val fuji: FujiProfileStore) {
+class DesktopAuxiliaryActions(
+    private val xmp: XmpSidecarStore,
+    private val fuji: FujiProfileStore,
+    private val writeGuard: () -> Boolean = { true },
+) {
     fun callbacks() = AuxiliaryActions(
-        load = { photo -> view(photo) },
-        updateFuji = { photo, updates -> fuji.mutate(photo, updates); view(photo, "FP2 persisted after readback") },
-        updateHdr = { photo, hdr -> xmp.mutateDevelop(photo, DevelopSettings(hdr.enabled, hdr.maximum, hdr.controls)); view(photo, "HDR persisted after readback") },
-        transferFujiToXmp = { photo -> val recipe = fuji.read(photo) ?: error("No Fuji profile"); xmp.mutateDevelopProperties(photo, evidencedXmpTransfer(recipe)); view(photo, "Evidenced Fuji fields transferred to XMP") },
-        transferXmpToFuji = { photo -> fuji.mutate(photo, evidencedFujiTransfer(xmp.readDevelop(photo))); view(photo, "Evidenced XMP fields transferred to FP2") },
+        load = { photo -> onIo { view(photo) } },
+        updateFuji = { photo, updates -> onIo { guarded { fuji.mutate(photo, updates) }; view(photo, "FP2 persisted after readback") } },
+        updateHdr = { photo, hdr -> onIo { requireRaf(photo); guarded { xmp.mutateDevelop(photo, DevelopSettings(hdr.enabled, hdr.maximum, hdr.controls)) }; view(photo, "HDR persisted after readback") } },
+        transferFujiToXmp = { photo -> onIo {
+            guarded {
+                xmp.withPhotoLock(photo) {
+                    val source = fuji.readSnapshot(photo) ?: error("No Fuji profile")
+                    xmp.mutateDevelopProperties(photo, evidencedXmpTransfer(source.recipe)) { fuji.confirmSnapshot(photo, source) }
+                }
+            }
+            view(photo, "Evidenced Fuji fields transferred to XMP")
+        } },
+        transferXmpToFuji = { photo -> onIo {
+            guarded {
+                xmp.withPhotoLock(photo) {
+                    val source = xmp.readDevelopSnapshot(photo)
+                    fuji.mutate(photo, evidencedFujiTransfer(source.settings)) { xmp.confirmDevelopSnapshot(photo, source) }
+                }
+            }
+            view(photo, "Evidenced XMP fields transferred to FP2")
+        } },
+        batchUpdate = { photos, edit -> onIo { batchUpdate(photos, edit) } },
     )
+
+    private suspend fun <T> onIo(block: () -> T): T = withContext(Dispatchers.IO) { block() }
+
+    private fun requireRaf(photo: Photo) {
+        require(photo.rawPath?.substringAfterLast('.', "")?.equals("raf", true) == true) { "HDR is supported only for RAW RAF photographs" }
+    }
+
+    private inline fun <T> guarded(block: () -> T): T {
+        check(writeGuard()) { "Write mode or library session changed before auxiliary write" }
+        return block().also { check(writeGuard()) { "Write mode or library session changed during auxiliary write" } }
+    }
+
+    private fun batchUpdate(photos: List<Photo>, edit: AuxiliaryBatchEdit): AuxiliaryBatchResult {
+        val distinct = photos.distinctBy { it.id }
+        check(writeGuard()) { "Write mode or library session changed before auxiliary batch" }
+        val requested = distinct.take(MAX_SENSITIVE_BATCH_PHOTOS)
+        val channel = if (edit is AuxiliaryBatchEdit.SetHdr) "HDR em RAF" else "Fuji FP2"
+        var succeeded = 0
+        var ignored = distinct.size - requested.size
+        var failed = 0
+        val items = mutableListOf<AuxiliaryBatchItemResult>()
+        fun record(photo: Photo, outcome: AuxiliaryBatchOutcome, errorCode: String? = null) {
+            items += AuxiliaryBatchItemResult(photo.id.take(64), channel, outcome, errorCode)
+            when (outcome) {
+                AuxiliaryBatchOutcome.SUCCEEDED -> succeeded++
+                AuxiliaryBatchOutcome.IGNORED -> ignored++
+                AuxiliaryBatchOutcome.FAILED -> failed++
+            }
+        }
+        requested.forEach { photo ->
+            if (!photo.writable || photo.rawPath?.substringAfterLast('.', "")?.equals("raf", true) != true) {
+                record(photo, AuxiliaryBatchOutcome.IGNORED)
+                return@forEach
+            }
+            if (edit is AuxiliaryBatchEdit.UpdateFuji) {
+                val recipe = runCatching { fuji.read(photo) }
+                if (recipe.isFailure) {
+                    record(photo, AuxiliaryBatchOutcome.FAILED, auxiliaryFailureCode(recipe.exceptionOrNull()))
+                    return@forEach
+                }
+                if (recipe.getOrNull()?.editable != true) {
+                    record(photo, AuxiliaryBatchOutcome.IGNORED)
+                    return@forEach
+                }
+            }
+            runCatching {
+                guarded {
+                    when (edit) {
+                        is AuxiliaryBatchEdit.SetHdr -> xmp.mutateDevelop(photo, DevelopSettings(edit.enabled, edit.maximum, edit.controls))
+                        is AuxiliaryBatchEdit.UpdateFuji -> fuji.mutate(photo, edit.updates)
+                    }
+                }
+            }.onSuccess { record(photo, AuxiliaryBatchOutcome.SUCCEEDED) }
+                .onFailure { record(photo, AuxiliaryBatchOutcome.FAILED, auxiliaryFailureCode(it)) }
+        }
+        return AuxiliaryBatchResult(channel, distinct.size, succeeded, ignored, failed, items)
+    }
+
+    private fun auxiliaryFailureCode(error: Throwable?): String = when (error) {
+        is XmpException -> "xmp-validation-failed"
+        is SecurityException -> "security-boundary-failed"
+        is IllegalArgumentException -> "profile-validation-failed"
+        is IllegalStateException -> "profile-state-changed"
+        else -> "operation-failed"
+    }
 
     private fun view(photo: Photo, status: String = "Recipe and HDR read") = AuxiliaryView(
         fuji = fuji.read(photo)?.let { FujiRecipeView(it.kind, it.editable, it.exposureBias, it.dynamicRange, it.filmSimulation, it.grainEffect, it.whiteBalance, it.wbShiftR, it.wbShiftB, it.highlightTone, it.shadowTone, it.color, it.sharpness, it.noiseReduction, it.lensModulation) },
-        hdr = xmp.readDevelop(photo).let { HdrView(it.hdrEnabled, it.hdrMaximum, it.controls) },
+        hdr = if (photo.rawPath?.substringAfterLast('.', "")?.equals("raf", true) == true) xmp.readDevelop(photo).let { HdrView(it.hdrEnabled, it.hdrMaximum, it.controls) } else HdrView(),
         status = status,
     )
 }

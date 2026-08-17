@@ -44,6 +44,9 @@ compose.desktop {
             packageVersion = providers.gradleProperty("app.versionName").get()
             description = "Native desktop photo curation"
             vendor = "Lincon Vidal"
+            linux {
+                iconFile.set(project.file("src/main/resources/icons/phototool-app-icon.png"))
+            }
         }
     }
 }

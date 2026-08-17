@@ -4,15 +4,9 @@ import br.com.lincon.phototool.domain.*
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.Node
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.channels.FileChannel
 import java.nio.charset.Charset
 import java.nio.file.*
-import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
 import javax.xml.transform.OutputKeys
@@ -42,41 +36,65 @@ data class DevelopSettings(
 )
 
 class XmpException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+internal data class XmpDevelopSnapshot(val settings: DevelopSettings, val contentDigest: String)
 
 /**
  * Adjacent sidecar store. Java NIO has no portable rename-exchange primitive, so
  * replacement uses a conservative same-directory fallback: fsync a sibling temp,
  * atomically displace the expected original to a unique previous name, compare the
- * displaced bytes again, and install with no-replace. A raced displacement is copied
+ * displaced bytes again, and install descriptor-relatively. A raced displacement is copied
  * to a unique conflict artifact and restored as canonical before failing closed.
  */
-class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean) : AutoCloseable {
-    private val locks = ConcurrentHashMap<String, Any>()
+class XmpSidecarStore internal constructor(
+    private val root: Path,
+    private val writeEnabled: Boolean,
+    authorityDisplaced: (() -> Unit)? = null,
+) : AutoCloseable {
     private val realRoot = root.toRealPath()
-    private val secure = if (writeEnabled) SecureLibraryBoundary(realRoot, true) else null
+    private val secure = SecureLibraryBoundary(realRoot, writeEnabled, authorityDisplaced)
 
-    fun read(photo: Photo): EditorialState {
+    fun read(photo: Photo): EditorialState = readWithSharedListings(photo, null)
+
+    internal fun readWithSharedListings(
+        photo: Photo,
+        sharedListings: MutableMap<String, List<SecureLibraryBoundary.Entry>>?,
+    ): EditorialState = withPhotoLock(photo) {
+        validatePinnedMedia(photo)
+        val sidecar = sidecar(photo)
+        validateReadableTopology(photo, sidecar, sharedListings)
+        if (!secure.exists(photo.authorityPath)) EditorialState()
+        else parse(secure.read(photo.authorityPath, MAX_XMP_BYTES)).state()
+    }
+
+    fun readDevelop(photo: Photo): DevelopSettings = withPhotoLock(photo) {
         validatePinnedMedia(photo)
         val sidecar = sidecar(photo)
         validateReadableTopology(photo, sidecar)
-        if (!Files.exists(sidecar, LinkOption.NOFOLLOW_LINKS)) return EditorialState()
-        return parse(readBounded(sidecar)).state()
+        if (!secure.exists(photo.authorityPath)) DevelopSettings()
+        else parse(secure.read(photo.authorityPath, MAX_XMP_BYTES)).developState()
     }
 
-    fun readDevelop(photo: Photo): DevelopSettings {
+    internal fun readDevelopSnapshot(photo: Photo): XmpDevelopSnapshot = withPhotoLock(photo) {
         validatePinnedMedia(photo)
         val sidecar = sidecar(photo)
         validateReadableTopology(photo, sidecar)
-        if (!Files.exists(sidecar, LinkOption.NOFOLLOW_LINKS)) return DevelopSettings()
-        return parse(readBounded(sidecar)).developState()
+        val bytes = if (secure.exists(photo.authorityPath)) secure.read(photo.authorityPath, MAX_XMP_BYTES) else baseXmp()
+        XmpDevelopSnapshot(parse(bytes).developState(), digestHex(bytes))
     }
 
-    fun mutate(photo: Photo, desired: EditorialState): EditorialState {
+    internal fun confirmDevelopSnapshot(photo: Photo, snapshot: XmpDevelopSnapshot): Boolean = withPhotoLock(photo) {
+        validatePinnedMedia(photo)
+        validateReadableTopology(photo, sidecar(photo))
+        val bytes = if (secure.exists(photo.authorityPath)) secure.read(photo.authorityPath, MAX_XMP_BYTES) else baseXmp()
+        digestHex(bytes) == snapshot.contentDigest
+    }
+
+    fun mutate(photo: Photo, desired: EditorialState, canonicalizeFlag: Boolean = false): EditorialState {
         val normalized = desired.copy(keywords = desired.keywords.map(::normalizeKeyword).distinctBy(::keywordCasefold))
         require(normalized.rating in 0..5 && normalized.keywords.size <= 256)
         return mutateDocument(photo) { document ->
             val current = document.state()
-            if (current == normalized) false else { document.applyEditorial(current, normalized); true }
+            document.applyEditorial(current, normalized, canonicalizeFlag)
         }.state()
     }
 
@@ -93,27 +111,32 @@ class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean)
         return mutateProperties(photo, updates).developState()
     }
 
-    fun mutateDevelopProperties(photo: Photo, updates: Map<String, String?>): DevelopSettings = mutateProperties(photo, updates).developState()
+    fun mutateDevelopProperties(
+        photo: Photo,
+        updates: Map<String, String?>,
+        sourceStillCurrent: (() -> Boolean)? = null,
+    ): DevelopSettings = mutateProperties(photo, updates, sourceStillCurrent).developState()
 
-    private fun mutateProperties(photo: Photo, updates: Map<String, String?>): XmpDocument {
+    private fun mutateProperties(photo: Photo, updates: Map<String, String?>, sourceStillCurrent: (() -> Boolean)? = null): XmpDocument {
         require(updates.isNotEmpty() && updates.keys.all { it in DEVELOP_FIELDS })
-        return mutateDocument(photo) { document -> document.applyDevelop(updates) }
+        return mutateDocument(photo, sourceStillCurrent) { document -> document.applyDevelop(updates) }
     }
 
-    private fun mutateDocument(photo: Photo, update: (XmpDocument) -> Boolean): XmpDocument {
+    private fun mutateDocument(photo: Photo, sourceStillCurrent: (() -> Boolean)? = null, update: (XmpDocument) -> Boolean): XmpDocument {
         check(writeEnabled) { "Launch with --enable-write to permit XMP changes" }
         check(photo.writable) { photo.issue ?: "Ambiguous photo is not writable" }
         val sidecar = sidecar(photo)
-        return synchronized(locks.computeIfAbsent(photo.id) { Any() }) {
+        return withPhotoLock(photo) {
             validateTopology(photo, sidecar)
             val relative = photo.authorityPath
-            val existed = secure!!.exists(relative)
+            val existed = secure.exists(relative)
+            val expectedEntry = if (existed) secure.expectation(relative) ?: throw XmpException("XMP identity disappeared") else null
             val original = if (existed) secure.read(relative, MAX_XMP_BYTES) else baseXmp()
             val originalDigest = digest(original)
             val document = parse(original)
             document.state()
             document.developState()
-            if (!update(document)) return@synchronized document
+            if (!update(document)) return@withPhotoLock document
             val updated = serialize(document)
             check(updated.size in 1..MAX_XMP_BYTES)
             // Parse and validate every managed property before touching the directory.
@@ -123,13 +146,25 @@ class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean)
             validateTopology(photo, sidecar)
             if (existed && digest(secure.read(relative, MAX_XMP_BYTES)) != originalDigest) throw XmpException("XMP changed concurrently")
             if (!existed && secure.exists(relative)) throw XmpException("XMP appeared concurrently")
-            secure.publish(relative, updated, if (existed) original else null, "xmp")
+            secure.publish(
+                relative,
+                updated,
+                if (existed) original else null,
+                "xmp",
+                expectedEntry,
+                beforeCommit = {
+                    check(sourceStillCurrent?.invoke() != false) { "Transfer source changed before XMP publication" }
+                },
+            )
             val installed = parse(secure.read(relative, MAX_XMP_BYTES))
             installed.state()
             installed.developState()
             installed
         }
     }
+
+    internal fun <T> withPhotoLock(photo: Photo, block: () -> T): T =
+        EditorialPhotoLocks.withLock(realRoot, photo, block)
 
     private fun sidecar(photo: Photo): Path {
         val resolved = realRoot.resolve(photo.authorityPath).normalize()
@@ -144,34 +179,30 @@ class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean)
 
     private fun validatePinnedMedia(photo: Photo) {
         val expected = photo.sourceIdentity ?: throw XmpException("Missing indexed media identity")
-        val attrs = secure?.attributes(expected.path) ?: run {
-            val authority = realRoot.resolve(expected.path).normalize()
-            if (!authority.startsWith(realRoot) || !Files.isRegularFile(authority, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(authority)) throw XmpException("Media authority changed")
-            Files.readAttributes(authority, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
-        }
+        val attrs = secure.attributes(expected.path) ?: throw XmpException("Media authority changed")
         val key = attrs.fileKey()?.toString() ?: throw XmpException("Stable media identity unavailable")
         if (!attrs.isRegularFile || key != expected.fileKey || attrs.size() != expected.size || attrs.lastModifiedTime().toMillis() != expected.modifiedMillis) throw XmpException("Media identity is stale")
     }
 
     private fun validateTopology(photo: Photo, sidecar: Path) {
-        val boundary = secure ?: throw XmpException("Secure write boundary unavailable")
+        val boundary = secure
         validatePinnedMedia(photo)
         val authorityRelative = photo.rawPath ?: photo.jpegPath ?: throw XmpException("Missing media authority")
         val authorityName = Path.of(authorityRelative).fileName.toString()
-        val stem = authorityName.substringBeforeLast('.').lowercase()
+        val stem = caseFoldText(authorityName.substringBeforeLast('.'))
         val parent = Path.of(authorityRelative).parent?.toString()?.replace('\\', '/') ?: ""
         val entries = boundary.list(parent)
         val entryNames = entries.map { it.name }
         val regularNames = entries.filter { it.attributes.isRegularFile }.map { it.name }
-        val raws = regularNames.filter { classifyMedia(it) == MediaKind.RAW && it.substringBeforeLast('.').lowercase() == stem }.toSet()
-        val jpegs = regularNames.filter { classifyMedia(it) == MediaKind.JPEG && it.substringBeforeLast('.').lowercase() == stem }.toSet()
+        val raws = regularNames.filter { classifyMedia(it) == MediaKind.RAW && caseFoldText(it.substringBeforeLast('.')) == stem }.toSet()
+        val jpegs = regularNames.filter { classifyMedia(it) == MediaKind.JPEG && caseFoldText(it.substringBeforeLast('.')) == stem }.toSet()
         val indexedRaws = setOfNotNull(photo.rawPath?.let { Path.of(it).fileName.toString() })
         val indexedJpegs = setOfNotNull(photo.jpegPath?.let { Path.of(it).fileName.toString() })
         if (raws != indexedRaws || jpegs != indexedJpegs) throw XmpException("Media topology changed")
-        val canonical = regularNames.filter { it.substringBeforeLast('.', it).lowercase() == stem && it.substringAfterLast('.', "").equals("xmp", true) }
+        val canonical = regularNames.filter { caseFoldText(it.substringBeforeLast('.', it)) == stem && it.substringAfterLast('.', "").equals("xmp", true) }
         val legacy = regularNames.filter { name ->
             val inner = name.substringBeforeLast('.', "")
-            classifyMedia(inner) != null && inner.substringBeforeLast('.').lowercase() == stem && name.substringAfterLast('.', "").equals("xmp", true)
+            classifyMedia(inner) != null && caseFoldText(inner.substringBeforeLast('.')) == stem && name.substringAfterLast('.', "").equals("xmp", true)
         }
         val expectedName = Path.of(photo.authorityPath).fileName.toString()
         if (canonical.size > 1 || legacy.isNotEmpty() || (canonical.isNotEmpty() && canonical.single() != expectedName)) throw XmpException("XMP authority is ambiguous")
@@ -181,35 +212,31 @@ class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean)
         }
     }
 
-    private fun validateReadableTopology(photo: Photo, sidecar: Path) {
+    private fun validateReadableTopology(
+        photo: Photo,
+        sidecar: Path,
+        sharedListings: MutableMap<String, List<SecureLibraryBoundary.Entry>>? = null,
+    ) {
         val expectedName = Path.of(photo.authorityPath).fileName.toString()
-        val stem = expectedName.substringBeforeLast('.').lowercase()
-        val entries = Files.list(sidecar.parent).use { it.toList() }
-        val entryNames = entries.map { it.fileName.toString() }
-        val regularNames = entries.filter { Files.isRegularFile(it, LinkOption.NOFOLLOW_LINKS) && !Files.isSymbolicLink(it) }.map { it.fileName.toString() }
-        val canonical = regularNames.filter { it.substringBeforeLast('.', it).lowercase() == stem && it.substringAfterLast('.', "").equals("xmp", true) }
+        val stem = caseFoldText(expectedName.substringBeforeLast('.'))
+        val parent = Path.of(photo.authorityPath).parent?.toString()?.replace('\\', '/') ?: ""
+        val entries = sharedListings?.getOrPut(parent) { secure.list(parent) } ?: secure.list(parent)
+        val entryNames = entries.map { it.name }
+        val regularNames = entries.filter { it.attributes.isRegularFile }.map { it.name }
+        val canonical = regularNames.filter { caseFoldText(it.substringBeforeLast('.', it)) == stem && it.substringAfterLast('.', "").equals("xmp", true) }
         val legacy = regularNames.filter { name ->
             val inner = name.substringBeforeLast('.', "")
-            classifyMedia(inner) != null && inner.substringBeforeLast('.').lowercase() == stem && name.substringAfterLast('.', "").equals("xmp", true)
+            classifyMedia(inner) != null && caseFoldText(inner.substringBeforeLast('.')) == stem && name.substringAfterLast('.', "").equals("xmp", true)
         }
         if (canonical.size > 1 || legacy.isNotEmpty() || (canonical.isNotEmpty() && canonical.single() != expectedName)) throw XmpException("XMP authority is ambiguous")
         if (canonical.isEmpty() && entryNames.any { isRecoveryArtifact(it, expectedName) }) throw XmpException("XMP recovery artifact requires manual recovery")
     }
 
-    private fun hardLinkCount(path: Path): Int = runCatching { (Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS) as Number).toInt() }.getOrDefault(1)
-    private fun forceDirectory(path: Path) { runCatching { FileChannel.open(path, StandardOpenOption.READ).use { it.force(true) } } }
+    private fun hardLinkCount(path: Path): Int = runCatching { (Files.getAttribute(path, "unix:nlink", LinkOption.NOFOLLOW_LINKS) as Number).toInt() }
+        .getOrElse { throw XmpException("Hard-link topology is unavailable", it) }
 
-    private fun readBounded(path: Path): ByteArray {
-        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(path) || hardLinkCount(path) != 1) throw XmpException("Unsafe XMP sidecar")
-        val size = Files.size(path)
-        if (size <= 0 || size > MAX_XMP_BYTES) throw XmpException("Malformed or oversized XMP")
-        return Files.readAllBytes(path).also { bytes ->
-            val utf16 = bytes.startsWithBytes(byteArrayOf(0xFF.toByte(), 0xFE.toByte())) || bytes.startsWithBytes(byteArrayOf(0xFE.toByte(), 0xFF.toByte()))
-            if (!utf16 && bytes.any { byte -> byte == 0.toByte() }) throw XmpException("XMP contains NUL bytes")
-        }
-    }
 
-    override fun close() { secure?.close() }
+    override fun close() { secure.close() }
 
     private fun parse(bytes: ByteArray): XmpDocument {
         val style = XmlStyle.detect(bytes)
@@ -254,6 +281,7 @@ class XmpSidecarStore(private val root: Path, private val writeEnabled: Boolean)
     }
 
     private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).contentToString()
+    private fun digestHex(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
     private fun baseXmp() = """<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="$RDF"><rdf:Description rdf:about="" xmlns:xmp="$XMP" xmlns:xmpDM="$XMP_DM"/></rdf:RDF></x:xmpmeta>""".toByteArray()
 }
 
@@ -279,38 +307,57 @@ private data class XmlStyle(val charset: Charset, val encodingName: String, val 
                 if (initial in setOf(Charsets.UTF_16LE, Charsets.UTF_16BE) && encoding?.uppercase()?.startsWith("UTF-16") == true) initial
                 else encoding?.let(Charset::forName) ?: initial
             }.getOrElse { throw XmpException("Unsupported XMP encoding") }
-            val newline = if ("\r\n" in probe) "\r\n" else "\n"
+            val newline = when {
+                "\r\n" in probe -> "\r\n"
+                '\r' in probe -> "\r"
+                else -> "\n"
+            }
             return XmlStyle(charset, encoding ?: charset.name(), declaration, bom, newline)
         }
     }
 }
 
 private class XmpDocument(val document: Document, val style: XmlStyle) {
-    private val description: Element get() {
+    private val descriptions: List<Element> get() {
         val descriptions = document.getElementsByTagNameNS(RDF, "Description")
-        if (descriptions.length != 1) throw XmpException("XMP must contain exactly one rdf:Description")
-        return descriptions.item(0) as Element
+        if (descriptions.length == 0) throw XmpException("XMP must contain rdf:Description")
+        return buildList { repeat(descriptions.length) { add(descriptions.item(it) as Element) } }
     }
+    private val description: Element get() = descriptions.first()
 
     private fun references(namespace: String, local: String): List<Pair<Element, Boolean>> = buildList {
-        if (description.hasAttributeNS(namespace, local)) add(description to true)
+        descriptions.forEach { description -> if (description.hasAttributeNS(namespace, local)) add(description to true) }
         val elements = document.getElementsByTagNameNS(namespace, local)
         repeat(elements.length) { add(elements.item(it) as Element to false) }
     }
 
+    private fun rawValues(namespace: String, local: String): List<String> = references(namespace, local).map { (owner, attribute) ->
+        if (attribute) owner.getAttributeNS(namespace, local) else owner.textContent.orEmpty()
+    }
+
     private fun value(namespace: String, local: String): String? {
-        val refs = references(namespace, local)
-        if (refs.size > 1) throw XmpException("Duplicate managed XMP $local values")
-        return refs.singleOrNull()?.let { (owner, attribute) -> if (attribute) owner.getAttributeNS(namespace, local) else owner.textContent.orEmpty() }
+        val values = rawValues(namespace, local)
+        if (values.distinct().size > 1) throw XmpException("Conflicting managed XMP $local values")
+        return values.firstOrNull()
     }
 
     fun state(): EditorialState {
-        val flag = when (value(XMP_DM, "pick") to value(XMP_DM, "good")) { (null to null), ("0" to null) -> Flag.UNFLAGGED; "1" to "True" -> Flag.PICK; "-1" to "False" -> Flag.REJECT; else -> throw XmpException("Unsupported flag mapping") }
+        val pickRaw = value(XMP_DM, "pick")
+        val pick = pickRaw?.takeIf { it.length <= 64 && it.matches(Regex("[+-]?[0-9]+")) }?.toIntOrNull()
+            ?: if (pickRaw == null) null else throw XmpException("Unsupported pick value")
+        val flag = when (pick) { null, 0 -> Flag.UNFLAGGED; 1 -> Flag.PICK; -1 -> Flag.REJECT; else -> throw XmpException("Unsupported pick value") }
+        val goodValues = rawValues(XMP_DM, "good")
+        val managedGood = goodValues.mapNotNull { raw -> when (raw.lowercase()) { "true" -> true; "false" -> false; else -> null } }.distinct()
+        if (managedGood.size > 1) throw XmpException("Conflicting managed XMP good values")
+        val good = managedGood.singleOrNull()
+        val goodError = if (goodValues.any { it.lowercase() !in setOf("true", "false") }) "xmp-good-invalid" else null
         val ratingRaw = value(XMP, "Rating")
         val rating = ratingRaw?.toIntOrNull() ?: if (ratingRaw == null) 0 else throw XmpException("Malformed rating")
         if (rating !in 0..5) throw XmpException("Unsupported rating")
-        val label = when (value(XMP, "Label")) { null -> null; "Red" -> ColorLabel.RED; "Yellow" -> ColorLabel.YELLOW; "Green" -> ColorLabel.GREEN; else -> throw XmpException("Unsupported label") }
-        return EditorialState(flag, rating, label, keywordValues())
+        val labels = rawValues(XMP, "Label").mapNotNull { raw -> when (raw) { "Red" -> ColorLabel.RED; "Yellow" -> ColorLabel.YELLOW; "Green" -> ColorLabel.GREEN; else -> null } }.distinct()
+        if (labels.size > 1) throw XmpException("Conflicting managed XMP Label values")
+        val label = labels.singleOrNull()
+        return EditorialState(flag, rating, label, keywordValues(), good, goodError)
     }
 
     fun developState(): DevelopSettings {
@@ -334,34 +381,51 @@ private class XmpDocument(val document: Document, val style: XmlStyle) {
         val output = mutableListOf<String>()
         val observed = mutableSetOf<String>()
         listOf(DC to "subject", LR to "hierarchicalSubject").forEach { (namespace, local) ->
-            val seenInArray = mutableSetOf<String>()
             val parents = document.getElementsByTagNameNS(namespace, local)
-            if (parents.length > 1) throw XmpException("Ambiguous keyword array")
-            if (parents.length == 1) {
-                val element = parents.item(0) as Element
+            val projections = buildList {
+                repeat(parents.length) { index ->
+                val element = parents.item(index) as Element
                 val children = element.childNodes.elements()
                 if (children.size != 1 || children.single().namespaceURI != RDF || children.single().localName != "Bag") throw XmpException("Keyword array must use rdf:Bag")
                 val items = children.single().childNodes.elements()
                 if (items.size > 256 || items.any { it.namespaceURI != RDF || it.localName != "li" || it.attributes.length != 0 || it.childNodes.elements().isNotEmpty() }) throw XmpException("Unsupported keyword items")
+                val localValues = mutableListOf<String>()
+                val seenInArray = mutableSetOf<String>()
                 items.forEach { item ->
-                    val normalized = normalizeKeyword(item.textContent)
+                    val normalized = runCatching { normalizeKeyword(item.textContent) }.getOrNull() ?: return@forEach
                     val key = keywordCasefold(normalized)
                     if (!seenInArray.add(key)) throw XmpException("Duplicate managed keyword")
-                    if (observed.add(key)) output += normalized
+                    localValues += normalized
                 }
+                add(localValues)
+                }
+            }
+            val folded = projections.map { values -> values.map(::keywordCasefold) }
+            if (folded.distinct().size > 1) throw XmpException("Conflicting managed keyword arrays")
+            projections.firstOrNull().orEmpty().forEach { normalized ->
+                if (observed.add(keywordCasefold(normalized))) output += normalized
             }
         }
         return output
     }
 
-    fun applyEditorial(current: EditorialState, desired: EditorialState) {
-        if (current.flag != desired.flag) when (desired.flag) { Flag.PICK -> { set(XMP_DM, "xmpDM:pick", "pick", "1"); set(XMP_DM, "xmpDM:good", "good", "True") }; Flag.UNFLAGGED -> { set(XMP_DM, "xmpDM:pick", "pick", "0"); remove(XMP_DM, "good") }; Flag.REJECT -> { set(XMP_DM, "xmpDM:pick", "pick", "-1"); set(XMP_DM, "xmpDM:good", "good", "False") } }
-        if (current.rating != desired.rating) set(XMP, "xmp:Rating", "Rating", desired.rating.toString())
+    fun applyEditorial(current: EditorialState, desired: EditorialState, canonicalizeFlag: Boolean): Boolean {
+        var changed = false
+        if (canonicalizeFlag || current.flag != desired.flag) {
+            val desiredPick = when (desired.flag) { Flag.PICK -> "1"; Flag.UNFLAGGED -> "0"; Flag.REJECT -> "-1" }
+            val desiredGood = when (desired.flag) { Flag.PICK -> "True"; Flag.UNFLAGGED -> null; Flag.REJECT -> "False" }
+            changed = value(XMP_DM, "pick") != desiredPick || rawValues(XMP_DM, "good").distinct() != listOfNotNull(desiredGood)
+            set(XMP_DM, "xmpDM:pick", "pick", desiredPick)
+            if (desiredGood == null) remove(XMP_DM, "good") else set(XMP_DM, "xmpDM:good", "good", desiredGood)
+        }
+        if (current.rating != desired.rating) { set(XMP, "xmp:Rating", "Rating", desired.rating.toString()); changed = true }
         if (current.label != desired.label) {
             val label = desired.label
             if (label == null) remove(XMP, "Label") else set(XMP, "xmp:Label", "Label", label.name.lowercase().replaceFirstChar { it.uppercase() })
+            changed = true
         }
-        if (current.keywords != desired.keywords) updateKeywords(current.keywords, desired.keywords)
+        if (current.keywords != desired.keywords) { updateKeywords(current.keywords, desired.keywords); changed = true }
+        return changed
     }
 
     fun applyDevelop(updates: Map<String, String?>): Boolean {
@@ -388,15 +452,13 @@ private class XmpDocument(val document: Document, val style: XmlStyle) {
 
     private fun set(namespace: String, qualified: String, local: String, content: String) {
         val refs = references(namespace, local)
-        if (refs.size > 1) throw XmpException("Duplicate managed XMP $local values")
         if (refs.isEmpty()) description.setAttributeNS(namespace, qualified, content)
-        else refs.single().let { (owner, attribute) -> if (attribute) owner.setAttributeNS(namespace, qualified, content) else owner.textContent = content }
+        else refs.forEach { (owner, attribute) -> if (attribute) owner.setAttributeNS(namespace, qualified, content) else owner.textContent = content }
     }
 
     private fun remove(namespace: String, local: String) {
         val refs = references(namespace, local)
-        if (refs.size > 1) throw XmpException("Duplicate managed XMP $local values")
-        refs.singleOrNull()?.let { (owner, attribute) -> if (attribute) owner.removeAttributeNS(namespace, local) else owner.parentNode.removeChild(owner) }
+        refs.forEach { (owner, attribute) -> if (attribute) owner.removeAttributeNS(namespace, local) else owner.parentNode.removeChild(owner) }
     }
 
     private fun updateKeywords(current: List<String>, desired: List<String>) {
@@ -412,23 +474,23 @@ private class XmpDocument(val document: Document, val style: XmlStyle) {
 
     private fun removeKeywordFromArray(namespace: String, local: String, folded: String) {
         val nodes = document.getElementsByTagNameNS(namespace, local)
-        if (nodes.length > 1) throw XmpException("Duplicate managed keyword array")
         if (nodes.length == 0) return
-        val property = nodes.item(0) as Element
-        val bag = property.childNodes.elements().singleOrNull() ?: throw XmpException("Keyword array must use rdf:Bag")
-        bag.childNodes.elements().filter { keywordCasefold(it.textContent) == folded }.forEach { bag.removeChild(it) }
-        if (bag.childNodes.elements().isEmpty()) property.parentNode.removeChild(property)
+        val properties = buildList { repeat(nodes.length) { add(nodes.item(it) as Element) } }
+        properties.forEach { property ->
+            val bag = property.childNodes.elements().singleOrNull() ?: throw XmpException("Keyword array must use rdf:Bag")
+            bag.childNodes.elements().filter { runCatching { keywordCasefold(it.textContent) }.getOrNull() == folded }.forEach { bag.removeChild(it) }
+            if (bag.childNodes.elements().isEmpty()) property.parentNode.removeChild(property)
+        }
     }
 
     private fun addKeywordToArray(namespace: String, qualified: String, keyword: String) {
         val local = qualified.substringAfter(':')
         val nodes = document.getElementsByTagNameNS(namespace, local)
-        if (nodes.length > 1) throw XmpException("Duplicate managed keyword array")
-        val bag = if (nodes.length == 0) {
+        val bags = if (nodes.length == 0) {
             val property = document.createElementNS(namespace, qualified)
-            document.createElementNS(RDF, "rdf:Bag").also { property.appendChild(it); description.appendChild(property) }
-        } else (nodes.item(0) as Element).childNodes.elements().singleOrNull() ?: throw XmpException("Keyword array must use rdf:Bag")
-        document.createElementNS(RDF, "rdf:li").also { it.textContent = keyword; bag.appendChild(it) }
+            listOf(document.createElementNS(RDF, "rdf:Bag").also { property.appendChild(it); description.appendChild(property) })
+        } else buildList { repeat(nodes.length) { index -> add((nodes.item(index) as Element).childNodes.elements().singleOrNull() ?: throw XmpException("Keyword array must use rdf:Bag")) } }
+        bags.forEach { bag -> document.createElementNS(RDF, "rdf:li").also { it.textContent = keyword; bag.appendChild(it) } }
     }
 
     private fun removeArray(namespace: String, local: String) {
@@ -449,7 +511,7 @@ private fun org.w3c.dom.NodeList.elements(): List<Element> = buildList { repeat(
 private fun ByteArray.startsWithBytes(prefix: ByteArray): Boolean = size >= prefix.size && prefix.indices.all { this[it] == prefix[it] }
 
 internal fun isRecoveryArtifact(name: String, canonicalName: String): Boolean {
-    val folded = name.lowercase()
-    val authority = canonicalName.lowercase()
+    val folded = caseFoldText(name)
+    val authority = caseFoldText(canonicalName)
     return folded.startsWith(".$authority.previous.") || folded.startsWith(".$authority.conflict.")
 }
