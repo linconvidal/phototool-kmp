@@ -1,6 +1,6 @@
 # phototool-kmp
 
-PhotoTool is a Kotlin Multiplatform and Compose Multiplatform photo curation application. The desktop application indexes CR2, CR3, DNG, RAF, JPG, and JPEG files. Editorial changes are stored only in adjacent XMP sidecars. Shared domain, state, filtering, and production UI code also compile for Android and iOS. Desktop is the only fully functional release target; Android and iOS are explicitly compile-only shared-UI hosts.
+PhotoTool is a Kotlin Multiplatform and Compose Multiplatform photo curation application. The desktop application indexes CR2, CR3, DNG, RAF, JPG, and JPEG files. Editorial changes are stored only in adjacent XMP sidecars. Shared domain, state, filtering, and production UI code also compile for Android, iOS, and WebAssembly. Desktop is the fully functional release target; Android and iOS are compile-only hosts. The web candidate uses the same production Compose UI with a read-only HTTP adapter.
 
 ## Safety contract
 
@@ -46,6 +46,40 @@ The project pins Kotlin 2.3.21, Compose Multiplatform 1.11.0, Gradle 9.1, and Ki
 Without `--library`, choose a folder in Settings. The default cache is `~/.cache/phototool-kmp`.
 
 On Linux Wayland, the GUI defaults to Skiko software rendering so display or GPU context loss during screen lock does not leave the window frozen after unlock. An explicit `skiko.renderApi` property or `SKIKO_RENDER_API` environment variable remains authoritative.
+
+## Shared Compose Web candidate
+
+`webApp` calls `shared/.../ui/PhotoToolApp.kt` through `ComposeViewport`. Gallery, filters, detail, zoom, filmstrip and editorial controls are the existing Compose components. `RemoteCurationStore` supplies one server-ordered page and query-aware detail neighbors; it does not filter incomplete HTTP summaries locally. `BrowserCurationApi` is GET-only, and `HttpPreviewLoader` loads same-origin JPEG previews with four concurrent loads and a 32 MiB decoded cache budget. Filmstrip thumbnails cover the loaded page; detail arrows can navigate beyond it.
+
+```bash
+# Build and test the pinned Kotlin 2.3.21 / Compose 1.11.0 implementation
+ANDROID_HOME=/home/linconvidal/Android/Sdk CHROME_BIN=/usr/bin/google-chrome ./gradlew --no-daemon :webApp:wasmJsBrowserDistribution :shared:jvmTest :shared:wasmJsBrowserTest :desktopApp:test :desktopApp:compileKotlin
+node --test scripts/webgl-presentation.test.mjs scripts/compose-input-focus.test.mjs
+
+# Serve a fresh copied synthetic fixture (36 JPEGs, external disposable cache), without scanning
+./gradlew --no-daemon :desktopApp:composeWebCandidate --args=8893
+# http://127.0.0.1:8893/
+
+# Alternatively, use an already-published snapshot in an isolated copied library/cache
+./gradlew --no-daemon :desktopApp:run --args="web --library /path/to/copied-library --cache /path/outside/library/cache --port 8893 --read-only"
+
+# Rendered interaction checks against the synthetic candidate; requires Playwright + its browsers
+# PLAYWRIGHT_MODULE can name an existing absolute path to playwright/index.mjs
+node scripts/check-compose-web.mjs http://127.0.0.1:8893 /tmp/phototool-compose-evidence
+```
+
+Desktop resources package `webApp/build/dist/wasmJs/productionExecutable/`. The server serves that bundle at `/`; the previous `src/main/resources/web/` implementation is retained locally but excluded from resource processing and no longer routed. HTML/CSS/JavaScript in the candidate only initializes the viewport, reports startup failure and handles renderer compatibility. No second set of screens is implemented there.
+
+This candidate cannot enable writes, synchronize, choose local folders or edit metadata, even if a server advertises write capability. Fuji/HDR, transfers and paired-file names are not exposed by the current API. Calendar and hierarchical folder browsing are disabled rather than inferred from a partial page; folder facets exist in the API but are not integrated here. Settings explains these limits. No published service is replaced by these commands.
+
+### Browser requirements and validation limits
+
+- [Compose 1.11 requires Kotlin 2.3.10+ for web](https://kotlinlang.org/docs/multiplatform/whats-new-compose-111.html); the pinned 2.3.21 is retained.
+- [Kotlin/Wasm requires WasmGC](https://kotlinlang.org/docs/wasm-configuration.html): Chrome 119+, Firefox 120+, Safari/WebKit 18.2+. [Safari 18.2 ships on iOS 18.2](https://webkit.org/blog/16301/webkit-features-in-safari-18-2/). There is no legacy JavaScript fallback.
+- Chromium desktop/mobile emulation and GTK WebKit 26.5 were exercised with real API responses and copied synthetic JPEGs. These are **not physical iPhone acceptance**. VoiceOver, device memory, battery use and the full canonical library remain outside this candidate's validation.
+- GTK WebKit exhibited stale/blank canvas frames after asynchronous image loads and resizing. `webgl-presentation.mjs` preserves WebGL buffers and flushes requested frames only on WebKit, using the workaround discussed in [CMP-11109](https://youtrack.jetbrains.com/issue/CMP-11109). Automated captures pass with it; physical Safari still needs review. It adds framebuffer memory and must be reassessed when upgrading Compose/Skiko. Web rail tooltips are omitted and the existing mobile menu items stay in-root to avoid stale accessibility mirrors from transient popup owners in Compose 1.11.
+- `compose-input-focus.mjs` applies two iOS WebKit input guards: the active-input check from [Compose PR #3446](https://github.com/JetBrains/compose-multiplatform-core/pull/3446) ([CMP-10825](https://youtrack.jetbrains.com/issue/CMP-10825)), and the consumed-release `touchend` cancellation from [PR #3232](https://github.com/JetBrains/compose-multiplatform-core/pull/3232) ([CMP-10438](https://youtrack.jetbrains.com/issue/CMP-10438)). Canceling `pointerup` alone does not prevent the browser's subsequent touch defaults from moving focus. The latter guard listens after Compose's canvas handler, cancels only the matching consumed touch release and resets on cancellation or a new touch. It leaves unconsumed gestures, unrelated elements and non-iOS browsers unchanged; it does not force focus or replace controls. Remove both guards when the pinned Compose version contains the fixes. `scripts/check-keyword-focus.mjs` checks trusted touch consumption, search, keywords, focus, typing, resize, reopening and horizontal/vertical navigation; `fixture-write` permits keyword persistence tests only against a 36-photo loopback fixture. Browser emulation does not verify the physical iPhone keyboard.
+- The initial JS/Wasm payload is approximately 13.3 MiB uncompressed. Skiko's renderer-info probe emits a recorded WebGL diagnostic in the automated browsers; runtime/CSP errors are checked separately.
 
 ## Arquivo fotográfico pela linha de comando
 
