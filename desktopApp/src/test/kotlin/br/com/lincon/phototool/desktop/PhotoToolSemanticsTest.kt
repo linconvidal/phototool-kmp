@@ -306,16 +306,16 @@ class PhotoToolSemanticsTest {
 
     @Test fun coalescedControllerPublishesOnlyCurrentGenerationAcrossThreeInterleavedFields() {
         val executor=Executors.newSingleThreadExecutor(); val firstStarted=CountDownLatch(1); val releaseFirst=CountDownLatch(1); val completed=CountDownLatch(1)
-        val publications=java.util.Collections.synchronizedList(mutableListOf<Pair<EditorialState,WriteState>>()); var calls=0
+        val publications=java.util.Collections.synchronizedList(mutableListOf<Pair<EditorialState,WriteState>>()); var calls=0; var authority=EditorialState()
         val controller=CoalescedEditController(executor) { _,_,_,editorial,status,_ -> publications += editorial to status; completed.countDown() }
         val base=EditorialState(); val selected=photo.copy(editorial=base)
         controller.submit(selected,base.copy(flag=Flag.PICK),persist={ _,_ -> calls++; firstStarted.countDown(); releaseFirst.await(5,TimeUnit.SECONDS); error("delayed stale failure") },updateCache={_,_->})
         assertTrue(firstStarted.await(5,TimeUnit.SECONDS))
-        controller.submit(selected.copy(editorial=base.copy(flag=Flag.PICK)),base.copy(flag=Flag.PICK,rating=4),persist={ _,desired -> calls++; desired },updateCache={_,_->})
+        controller.submit(selected.copy(editorial=base.copy(flag=Flag.PICK)),base.copy(flag=Flag.PICK,rating=4),persist={ source,desired -> calls++; mergeEditorial(source.editorial,desired,authority).also { authority=it } },updateCache={_,_->})
         val final=base.copy(flag=Flag.PICK,rating=4,label=ColorLabel.GREEN)
-        controller.submit(selected.copy(editorial=base.copy(flag=Flag.PICK,rating=4)),final,persist={ _,desired -> calls++; desired },updateCache={_,_->})
+        controller.submit(selected.copy(editorial=base.copy(flag=Flag.PICK,rating=4)),final,persist={ source,desired -> calls++; mergeEditorial(source.editorial,desired,authority).also { authority=it } },updateCache={_,_->})
         releaseFirst.countDown(); assertTrue(completed.await(5,TimeUnit.SECONDS)); executor.shutdown(); assertTrue(executor.awaitTermination(5,TimeUnit.SECONDS))
-        assertEquals(2,calls); assertEquals(listOf(final to WriteState.PERSISTED),publications)
+        assertEquals(2,calls); assertEquals(listOf(base.copy(rating=4,label=ColorLabel.GREEN) to WriteState.PERSISTED),publications)
     }
 
     @Test fun coalescedEditsWithSamePhotoIdAreIsolatedByLibrarySession() {
@@ -408,6 +408,22 @@ class PhotoToolSemanticsTest {
         onNodeWithContentDescription("Marcar como escolhida").performClick()
         waitForIdle()
         assert(desired?.flag==Flag.PICK)
+    }
+
+    @Test fun flagTargetWithMicroDragMovementStillDispatchesTheClickedFlag() = runComposeUiTest {
+        var desired: EditorialState?=null; var calls=0
+        val state=AppState(library="/copy",cache="/cache",photos=listOf(photo),selectedId=photo.id,screen=Screen.DETAIL,writeEnabled=true)
+        setContent { PhotoToolApp(state,AppCallbacks(dispatch={},mutate={_,editorial->calls++; desired=editorial})) }
+        // A real mouse click is rarely perfectly static: down, enough drift to trip the
+        // horizontal drag detector (past touch slop) but not enough to leave the slot.
+        onNodeWithContentDescription("Marcar como escolhida").performTouchInput {
+            down(center)
+            moveBy(androidx.compose.ui.geometry.Offset(40f, 0f))
+            up()
+        }
+        waitForIdle()
+        assertEquals(1, calls)
+        assertEquals(Flag.PICK, desired?.flag)
     }
 
     @Test fun enterAddsAValidKeywordWithoutClickingTheButton() = runComposeUiTest {
@@ -517,15 +533,20 @@ class PhotoToolSemanticsTest {
         onNodeWithContentDescription("Aumentar exposição Fuji").assertExists().assertIsEnabled()
     }
 
-    @Test fun lowDetailKeepsPhotographAndScrollableInspectorVisible() = runComposeUiTest {
+    @Test fun lowDetailKeepsPhotographLargeAndInspectorAvailableOnDemand() = runComposeUiTest {
         val selected=photo.copy(writable=true,rawPath="2025/IMG_1.RAF",jpegPath=null)
         val state=AppState(library="/copy",cache="/cache",photos=listOf(selected),selectedId=selected.id,screen=Screen.DETAIL,writeEnabled=true)
         setContent { Box(Modifier.width(600.dp).height(360.dp)) { PhotoToolApp(state,AppCallbacks(dispatch={})) } }
         waitForIdle()
         val viewer=onNodeWithContentDescription("Visualizador da fotografia").assertIsDisplayed().getUnclippedBoundsInRoot()
-        val inspector=onNodeWithContentDescription("Painel de curadoria da fotografia").assertIsDisplayed().getUnclippedBoundsInRoot()
-        assertTrue(viewer.right-viewer.left > 250.dp); assertTrue(inspector.right-inspector.left >= 280.dp); assertTrue(viewer.bottom-viewer.top >= 350.dp)
+        assertTrue(viewer.right-viewer.left >= 590.dp); assertTrue(viewer.bottom-viewer.top >= 350.dp)
+        onNodeWithContentDescription("Painel de curadoria da fotografia").assertDoesNotExist()
+        onNodeWithContentDescription("Abrir curadoria e metadados").performClick()
+        onNodeWithContentDescription("Painel de curadoria da fotografia").assertIsDisplayed()
         onNodeWithText("CURADORIA").assertIsDisplayed()
+        onNodeWithContentDescription("Mostrar receitas e HDR").performScrollTo().assertIsDisplayed()
+        onNodeWithContentDescription("Fechar curadoria e metadados").performClick()
+        onNodeWithContentDescription("Painel de curadoria da fotografia").assertDoesNotExist()
     }
 
     @Test fun filmstripScrollsCurrentHighIndexIntoViewport() = runComposeUiTest {
@@ -534,6 +555,7 @@ class PhotoToolSemanticsTest {
         val state=AppState(library="/copy",cache="/cache",photos=photos,selectedId=selected.id,screen=Screen.DETAIL)
         setContent { Box(Modifier.width(600.dp).height(700.dp)) { PhotoToolApp(state,AppCallbacks(dispatch={})) } }
         waitForIdle()
+        onNodeWithContentDescription("Abrir miniaturas").performClick()
         onNodeWithContentDescription("Filmstrip ${selected.displayName}").assertIsDisplayed().assertIsSelected()
     }
 

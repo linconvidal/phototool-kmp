@@ -40,9 +40,13 @@ data class AppState(
     val filtersOpen: Boolean = false,
     val helpOpen: Boolean = false,
     val sync: SyncStatus = SyncStatus(),
+    val remote: RemoteBrowseState? = null,
 ) {
-    val visiblePhotos get() = filterAndOrder(photos, effectiveQuery(section, query))
-    val selected get() = photos.firstOrNull { it.id == selectedId }
+    // Remote summaries omit fields used by filtering; only the server can filter/order them.
+    val visiblePhotos get() = if (remote != null) photos else filterAndOrder(photos, effectiveQuery(section, query))
+    val visiblePhotoCount get() = remote?.total ?: visiblePhotos.size
+    val totalPhotoCount get() = remote?.libraryTotal ?: photos.size
+    val selected get() = remote?.detail?.takeIf { it.id == selectedId } ?: photos.firstOrNull { it.id == selectedId }
     val selectionIds get() = if (selectedIds.isEmpty() && selectedId != null) setOf(selectedId) else selectedIds
     val selectedPhotos get() = selectionIds.mapNotNull { id -> photos.firstOrNull { it.id == id } }
 }
@@ -122,6 +126,7 @@ fun reduce(state: AppState, action: Action): AppState = when (action) {
 private fun applyQuery(state: AppState, query: Query): AppState {
     if (queryDateError(query.fromDate, query.toDate) != null) return state
     val normalized = if (state.section == LibrarySection.PICKS) query.copy(flag = null) else query
+    if (state.remote != null) return state.copy(query = normalized, selectedId = null, selectedIds = emptySet(), selectionAnchorId = null)
     val visibleIds = filterAndOrder(state.photos, effectiveQuery(state.section, normalized)).mapTo(linkedSetOf()) { it.id }
     val selectedIds = state.selectionIds.intersect(visibleIds).take(MAX_BATCH_PHOTOS).toSet()
     val primary = state.selectedId?.takeIf(visibleIds::contains) ?: selectedIds.firstOrNull()
