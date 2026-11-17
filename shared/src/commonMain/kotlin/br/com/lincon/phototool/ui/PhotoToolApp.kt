@@ -350,6 +350,9 @@ fun estimatedMasonryNeighbor(photos: List<Photo>, currentId: String, columns: In
 }
 
 private const val MIN_DETAIL_ZOOM = 1f
+
+/** Zoom where native crops start. Asking for and painting them share this single threshold. */
+private const val REGION_START_ZOOM = 4f
 private const val BASE_MAX_DETAIL_ZOOM = 8f
 private const val HARD_MAX_DETAIL_ZOOM = 64f
 private val baseDetailZoomStops = listOf(1f, 1.25f, 1.5f, 2f, 3f, 4f, 6f, 8f)
@@ -360,6 +363,12 @@ internal fun detailPixelZoom(viewport: IntSize, image: IntSize): Float {
     val fit = minOf(viewport.width.toFloat() / image.width, viewport.height.toFloat() / image.height)
     return (1f / fit).coerceAtLeast(MIN_DETAIL_ZOOM)
 }
+
+/**
+ * Zoom from which native crops are asked for, kept and painted. One function for all three, because
+ * asking and clearing on different thresholds leaves stale crops over the upscaled preview.
+ */
+internal fun detailRegionZoom(pixelZoom: Float): Float = minOf(pixelZoom, REGION_START_ZOOM)
 
 /** Enough magnification to inspect the actual pixels, never below the previous 8x ceiling. */
 internal fun detailMaxZoom(pixelZoom: Float): Float =
@@ -2202,15 +2211,16 @@ private fun DetailImageArea(
     val pixelZoom = detailPixelZoom(viewportSize, nativeSize ?: imageSize)
     val zoomStops = detailZoomStops(pixelZoom)
     val maximumZoom = detailMaxZoom(pixelZoom)
-    // Regions start as soon as the display bitmap is upscaled, and stay native at 1:1.
-    // Regions start at 400%: early enough to avoid visible upscaling, before native 1:1.
-    val sharpZoom = minOf(pixelZoom, 4f)
+    // One threshold for asking, keeping and painting crops: below it the display bitmap is enough.
+    // Asking and clearing used to disagree, which left stale crops painted over the upscaled preview.
+    val regionZoom = detailRegionZoom(pixelZoom)
     var regions by remember(photo.id) { mutableStateOf<List<RegionView>>(emptyList()) }
-    if (zoom + .01f < sharpZoom) LaunchedEffect(photo.id, zoom, sharpZoom) { regions = emptyList() }
     // One pump per photo: panning never cancels the request in flight. The demand is recomputed
     // after every response, so a continuous drag keeps receiving native crops instead of falling
     // back to the 2048 px display bitmap outside the last crop.
-    val regionsActive = preparedBitmap != null && nativeSize != null && zoom + .01f >= pixelZoom
+    val regionsActive = preparedBitmap != null && nativeSize != null && zoom + .01f >= regionZoom
+    // A crop never outlives the zoom that asked for it.
+    LaunchedEffect(photo.id, regionsActive) { if (!regionsActive) regions = emptyList() }
     LaunchedEffect(photo.id, regionsActive, viewportSize, nativeSize, preparedBitmap) {
         if (!regionsActive) return@LaunchedEffect
         var requested: NativeRegion? = null
@@ -2349,7 +2359,7 @@ private fun DetailImageArea(
                 previewDimensionsChanged = { imageSize = it },
                 preparedBitmap = effectiveBitmap,
                 nativeSize = nativeSize,
-                regions = regions,
+                regions = if (regionsActive) regions else emptyList(),
                 filterQuality = detailFilterQuality(zoom, pixelZoom),
             )
             if (!compact) {

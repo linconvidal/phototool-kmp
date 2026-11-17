@@ -290,37 +290,9 @@ class PreviewStore private constructor(
         return CachedPreviewBytes(bytes, key)
     }
 
-    private fun readNativeRegion(channel: FileChannel, contentLength: Long, x: Int, y: Int, width: Int, height: Int): ByteArray {
-        var sourceWidth = 0
-        var sourceHeight = 0
-        val cropped = MemoryCacheImageInputStream(
-            ByteArrayInputStream(readOriginalJpegHeader(channel, contentLength)),
-        ).use { input ->
-            val reader = ImageIO.getImageReaders(input).asSequence().firstOrNull()
-                ?: throw PreviewException(PreviewFailure.UNSUPPORTED_MEDIA, "Image decoder unavailable")
-            try {
-                reader.input = input
-                sourceWidth = reader.getWidth(0)
-                sourceHeight = reader.getHeight(0)
-                if (x.toLong() + width > sourceWidth || y.toLong() + height > sourceHeight) {
-                    throw PreviewException(PreviewFailure.UNSUPPORTED_MEDIA, "Region exceeds the native image")
-                }
-                val params = reader.defaultReadParam.apply { setSourceRegion(java.awt.Rectangle(x, y, width, height)) }
-                reader.read(0, params)
-            } finally { reader.dispose() }
-        }
-        val output = ByteArrayOutputStream()
-        val writer = ImageIO.getImageWritersByFormatName("jpeg").asSequence().firstOrNull()
-            ?: throw PreviewException(PreviewFailure.UNAVAILABLE, "JPEG encoder unavailable")
-        ImageIO.createImageOutputStream(output).use { stream ->
-            writer.output = stream
-            val params = writer.defaultWriteParam.apply { if (canWriteCompressed()) { compressionMode = ImageWriteParam.MODE_EXPLICIT; compressionQuality = .95f } }
-            writer.write(null, IIOImage(cropped, null, null), params)
-        }
-        writer.dispose()
-        cropped.flush()
-        return output.toByteArray()
-    }
+    /** Uses the header bytes this class already attests, and crops in presented orientation. */
+    private fun readNativeRegion(channel: FileChannel, contentLength: Long, x: Int, y: Int, width: Int, height: Int): ByteArray =
+        cropJpegRegion(readOriginalJpegHeader(channel, contentLength), x, y, width, height)
 
     /** Reads only the header needed to measure the JPEG, keeping memory bounded. */
     private fun readOriginalJpegHeader(channel: FileChannel, contentLength: Long): ByteArray {
@@ -564,6 +536,110 @@ internal fun applyTiffOrientation(source: BufferedImage, orientation: TiffOrient
     }
 }
 
+/** Dimensions the photograph is presented in, which is the space every published rectangle uses. */
+internal fun uprightSize(sourceWidth: Int, sourceHeight: Int, orientation: TiffOrientation?): java.awt.Dimension =
+    if (orientation != null && orientation.hasFlippedDimensions()) java.awt.Dimension(sourceHeight, sourceWidth)
+    else java.awt.Dimension(sourceWidth, sourceHeight)
+
+/**
+ * Rectangle of the stored pixel grid that becomes the upright [x], [y], [width], [height] once the
+ * orientation is applied. Every EXIF orientation maps a rectangle onto a rectangle, so this is the exact
+ * inverse of [applyTiffOrientation] and never needs clipping.
+ */
+internal fun sourceRectForUpright(
+    x: Int,
+    y: Int,
+    width: Int,
+    height: Int,
+    sourceWidth: Int,
+    sourceHeight: Int,
+    orientation: TiffOrientation?,
+): java.awt.Rectangle {
+    if (orientation == null) return java.awt.Rectangle(x, y, width, height)
+    return when (orientation) {
+        TiffOrientation.STANDARD -> java.awt.Rectangle(x, y, width, height)
+        TiffOrientation.MIRROR_HORIZONTAL -> java.awt.Rectangle(sourceWidth - x - width, y, width, height)
+        TiffOrientation.UPSIDE_DOWN -> java.awt.Rectangle(sourceWidth - x - width, sourceHeight - y - height, width, height)
+        TiffOrientation.MIRROR_VERTICAL -> java.awt.Rectangle(x, sourceHeight - y - height, width, height)
+        TiffOrientation.MIRROR_HORIZONTAL_AND_ROTATE_LEFT -> java.awt.Rectangle(y, x, height, width)
+        TiffOrientation.ROTATE_RIGHT -> java.awt.Rectangle(y, sourceHeight - x - width, height, width)
+        TiffOrientation.MIRROR_HORIZONTAL_AND_ROTATE_RIGHT ->
+            java.awt.Rectangle(sourceWidth - y - height, sourceHeight - x - width, height, width)
+        TiffOrientation.ROTATE_LEFT -> java.awt.Rectangle(sourceWidth - y - height, x, height, width)
+    }
+}
+
+/** EXIF values 1..8 in the order the enum declares them. */
+private val exifOrientations = listOf(
+    TiffOrientation.STANDARD,
+    TiffOrientation.MIRROR_HORIZONTAL,
+    TiffOrientation.UPSIDE_DOWN,
+    TiffOrientation.MIRROR_VERTICAL,
+    TiffOrientation.MIRROR_HORIZONTAL_AND_ROTATE_LEFT,
+    TiffOrientation.ROTATE_RIGHT,
+    TiffOrientation.MIRROR_HORIZONTAL_AND_ROTATE_RIGHT,
+    TiffOrientation.ROTATE_LEFT,
+)
+
+/**
+ * Orientation declared by the JPEG itself. It is read from the header the crop already needs, so a
+ * rotated photograph never depends on the snapshot carrying the rotation.
+ */
+internal fun jpegExifOrientation(bytes: ByteArray): TiffOrientation? {
+    if (bytes.size < 4 || bytes[0] != 0xFF.toByte() || bytes[1] != 0xD8.toByte()) return null
+    var index = 2
+    while (index + 4 <= bytes.size) {
+        if (bytes[index] != 0xFF.toByte()) return null
+        val marker = bytes[index + 1].toInt() and 0xFF
+        if (marker == 0x01 || marker == 0xD8 || marker in 0xD0..0xD7) { index += 2; continue }
+        if (marker == 0xD9 || marker == 0xDA) return null
+        val length = ((bytes[index + 2].toInt() and 0xFF) shl 8) or (bytes[index + 3].toInt() and 0xFF)
+        if (length < 2 || index + 2 + length > bytes.size) return null
+        val payload = index + 4
+        if (marker == 0xE1 && length >= 8 &&
+            bytes[payload] == 'E'.code.toByte() && bytes[payload + 1] == 'x'.code.toByte() &&
+            bytes[payload + 2] == 'i'.code.toByte() && bytes[payload + 3] == 'f'.code.toByte() &&
+            bytes[payload + 4] == 0.toByte() && bytes[payload + 5] == 0.toByte()
+        ) {
+            return exifOrientation(bytes, payload + 6, index + 2 + length)
+        }
+        index += 2 + length
+    }
+    return null
+}
+
+private fun exifOrientation(bytes: ByteArray, tiffStart: Int, tiffEnd: Int): TiffOrientation? {
+    if (tiffEnd - tiffStart < 8) return null
+    val little = bytes[tiffStart] == 'I'.code.toByte() && bytes[tiffStart + 1] == 'I'.code.toByte()
+    val big = bytes[tiffStart] == 'M'.code.toByte() && bytes[tiffStart + 1] == 'M'.code.toByte()
+    if (!little && !big) return null
+    fun u16(at: Int): Int {
+        if (at + 2 > tiffEnd) return -1
+        val first = bytes[at].toInt() and 0xFF
+        val second = bytes[at + 1].toInt() and 0xFF
+        return if (little) first or (second shl 8) else (first shl 8) or second
+    }
+    fun u32(at: Int): Long {
+        if (at + 4 > tiffEnd) return -1
+        var value = 0L
+        for (offset in 0 until 4) {
+            val byte = bytes[at + offset].toLong() and 0xFF
+            value = if (little) value or (byte shl (8 * offset)) else (value shl 8) or byte
+        }
+        return value
+    }
+    val directory = tiffStart + u32(tiffStart + 4).toInt()
+    if (directory < tiffStart || directory + 2 > tiffEnd) return null
+    val entries = u16(directory)
+    if (entries < 0) return null
+    for (entry in 0 until entries) {
+        val at = directory + 2 + entry * 12
+        if (at + 12 > tiffEnd) return null
+        if (u16(at) == 0x0112) return exifOrientations.getOrNull(u16(at + 8) - 1)
+    }
+    return null
+}
+
 enum class PreviewFailure { STALE_SOURCE, UNSUPPORTED_MEDIA, UNSAFE_SOURCE, UNSAFE_CACHE, UNAVAILABLE }
 
 class PreviewException(
@@ -573,3 +649,53 @@ class PreviewException(
 ) : RuntimeException(message, cause)
 
 private inline fun <T : java.awt.Graphics2D, R> T.use(block: (T) -> R): R = try { block(this) } finally { dispose() }
+
+/**
+ * Crops native pixels in the orientation the photograph is presented in. The rectangle arrives in
+ * upright coordinates, like every other dimension the server publishes, so it is mapped back to the
+ * stored pixel grid before decoding and rotated afterwards. Without that round trip a photograph
+ * carrying an EXIF rotation returns a rectangle from somewhere else in the frame.
+ */
+internal fun cropJpegRegion(bytes: ByteArray, x: Int, y: Int, width: Int, height: Int): ByteArray {
+    val orientation = jpegExifOrientation(bytes)
+    val cropped = MemoryCacheImageInputStream(ByteArrayInputStream(bytes)).use { input ->
+        val reader = ImageIO.getImageReaders(input).asSequence().firstOrNull()
+            ?: throw PreviewException(PreviewFailure.UNSUPPORTED_MEDIA, "Image decoder unavailable")
+        try {
+            reader.input = input
+            val sourceWidth = reader.getWidth(0)
+            val sourceHeight = reader.getHeight(0)
+            val upright = uprightSize(sourceWidth, sourceHeight, orientation)
+            if (x.toLong() + width > upright.width || y.toLong() + height > upright.height) {
+                throw PreviewException(PreviewFailure.UNSUPPORTED_MEDIA, "Region exceeds the native image")
+            }
+            val source = sourceRectForUpright(x, y, width, height, sourceWidth, sourceHeight, orientation)
+            if (source.x < 0 || source.y < 0 || source.x.toLong() + source.width > sourceWidth || source.y.toLong() + source.height > sourceHeight) {
+                throw PreviewException(PreviewFailure.UNSUPPORTED_MEDIA, "Region exceeds the stored pixels")
+            }
+            val params = reader.defaultReadParam.apply { setSourceRegion(java.awt.Rectangle(source.x, source.y, source.width, source.height)) }
+            // A JPEG reader may widen the request to whole MCU blocks; the proven rectangle is the crop.
+            val decoded = reader.read(0, params)
+            val exact = if (decoded.width == source.width && decoded.height == source.height) decoded else decoded.getSubimage(
+                0,
+                0,
+                minOf(source.width, decoded.width),
+                minOf(source.height, decoded.height),
+            )
+            applyTiffOrientation(exact, orientation)
+        } finally {
+            reader.dispose()
+        }
+    }
+    val output = ByteArrayOutputStream()
+    val writer = ImageIO.getImageWritersByFormatName("jpeg").asSequence().firstOrNull()
+        ?: throw PreviewException(PreviewFailure.UNAVAILABLE, "JPEG encoder unavailable")
+    ImageIO.createImageOutputStream(output).use { stream ->
+        writer.output = stream
+        val params = writer.defaultWriteParam.apply { if (canWriteCompressed()) { compressionMode = ImageWriteParam.MODE_EXPLICIT; compressionQuality = .95f } }
+        writer.write(null, IIOImage(cropped, null, null), params)
+    }
+    writer.dispose()
+    cropped.flush()
+    return output.toByteArray()
+}
