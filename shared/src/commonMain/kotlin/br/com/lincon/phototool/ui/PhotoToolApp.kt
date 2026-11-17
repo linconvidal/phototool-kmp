@@ -386,14 +386,26 @@ internal fun detailZoomStops(pixelZoom: Float): List<Float> {
 internal fun detailFilterQuality(zoom: Float, pixelZoom: Float): FilterQuality =
     if (zoom >= maxOf(2f, pixelZoom * .5f)) FilterQuality.None else FilterQuality.Low
 
-internal data class NativeRegion(val x: Int, val y: Int, val width: Int, val height: Int)
+internal data class NativeRegion(val x: Int, val y: Int, val width: Int, val height: Int) {
+    fun contains(other: NativeRegion): Boolean =
+        other.x >= x && other.y >= y && other.x + other.width <= x + width && other.y + other.height <= y + height
+}
+
 internal data class RegionView(val bitmap: ImageBitmap, val x: Int, val y: Int, val width: Int, val height: Int) {
     val region: NativeRegion get() = NativeRegion(x, y, width, height)
 }
 
+/** Where a native rectangle lands on screen, with every edge rounded once. */
+internal data class RegionPlacement(val x: Int, val y: Int, val width: Int, val height: Int)
+
 /** Native margin fetched around the visible window at 1:1, so a drag has sharp pixels ahead. */
 internal const val DETAIL_REGION_MARGIN = 2.6f
-internal const val DETAIL_REGION_BUDGET_PIXELS = 8_000_000L
+/** Native pixels one crop may ask for; this is also the server's bound for a single region. */
+internal const val DETAIL_REGION_TILE_PIXELS = 4_000_000L
+/** Native pixels one pump may ask for in total, so a wide window becomes a few bounded tiles. */
+internal const val DETAIL_REGION_TOTAL_PIXELS = 6_000_000L
+/** Two pumps' worth of tiles, so a pan never evicts the set that covers the current window. */
+internal const val DETAIL_REGION_BUDGET_PIXELS = 2 * DETAIL_REGION_TOTAL_PIXELS
 /** Floor between two crop requests, so a fast drag conflates instead of flooding the decoder. */
 internal const val DETAIL_REGION_MIN_SPACING_MS = 60L
 
@@ -440,16 +452,163 @@ internal fun visibleNativeRegion(
     return NativeRegion(x, y, w, h)
 }
 
-/** Fraction of [visible] already covered by retained crops, sampled on a small fixed grid. */
-internal fun regionCoverage(regions: List<NativeRegion>, visible: NativeRegion, columns: Int = 3, rows: Int = 4): Float {
-    if (regions.isEmpty() || visible.width <= 0 || visible.height <= 0) return 0f
-    var inside = 0
-    for (row in 0 until rows) for (column in 0 until columns) {
-        val x = visible.x + (visible.width * (column + .5f) / columns).toInt()
-        val y = visible.y + (visible.height * (row + .5f) / rows).toInt()
-        if (regions.any { x >= it.x && x < it.x + it.width && y >= it.y && y < it.y + it.height }) inside++
+/** What the frame actually shows, without the caps that bound a single crop for decoding. */
+internal fun visibleNativeWindow(viewport: IntSize, native: IntSize, zoom: Float, pan: Offset): NativeRegion? =
+    visibleNativeRegion(
+        viewport, native, zoom, pan, margin = 1f,
+        maximumSide = maxOf(native.width, native.height),
+        maximumPixels = Long.MAX_VALUE,
+    )
+
+private fun ceilingDivide(value: Int, divisor: Int): Int = if (value <= 0) 0 else (value - 1) / divisor + 1
+
+/** Largest tile side a split of [extent] into [parts] produces. */
+private fun tileSide(extent: Int, parts: Int): Int = ceilingDivide(extent, parts)
+
+/**
+ * Native rectangles that together cover the visible window. One crop used to be the whole answer,
+ * capped at 2048 px, so from the region threshold upwards the frame showed sharp pixels in the
+ * middle and the upscaled preview around them: a seam crossing the photograph. The window is split
+ * into contiguous tiles instead, each one within what the server decodes and the whole set within
+ * what one pump may ask for. Windows that still fit stay a single crop with the panning margin.
+ *
+ * A window larger than [totalPixels] is covered as a whole anyway: coverage wins over the budget,
+ * because leaving the excess on the upscaled preview is the visible defect this replaces.
+ */
+internal fun visibleNativeRegions(
+    viewport: IntSize,
+    native: IntSize,
+    zoom: Float,
+    pan: Offset,
+    margin: Float = DETAIL_REGION_MARGIN,
+    maximumSide: Int = 2048,
+    maximumPixels: Long = DETAIL_REGION_TILE_PIXELS,
+    totalPixels: Long = DETAIL_REGION_TOTAL_PIXELS,
+    lead: Offset = Offset.Zero,
+): List<NativeRegion> {
+    val visible = visibleNativeWindow(viewport, native, zoom, pan) ?: return emptyList()
+    val visiblePixels = visible.width.toLong() * visible.height
+    // One crop is only the answer when the window, plus its panning margin, still fits decoding.
+    // Checking the window alone was the bug: a window taller than one crop looked covered even
+    // though the capped crop could not reach its edges.
+    if (visible.width <= maximumSide && visible.height <= maximumSide && visiblePixels <= maximumPixels) {
+        val single = visibleNativeRegion(viewport, native, zoom, pan, margin, maximumSide, maximumPixels, lead)
+        if (single != null && single.contains(visible)) return listOf(single)
     }
-    return inside.toFloat() / (columns * rows)
+    // Grow the window by the panning margin only as far as one pump budget allows, keeping it
+    // centred on what is shown; then split that rectangle into contiguous tiles.
+    val growth = kotlin.math.sqrt(maxOf(totalPixels, visiblePixels).toDouble() / visiblePixels).toFloat()
+    var allowedWidth = (visible.width * growth).roundToInt().coerceIn(visible.width, native.width)
+    var allowedHeight = (visible.height * growth).roundToInt().coerceIn(visible.height, native.height)
+    // Rounding both sides up can overshoot the area budget by a few pixels; shave the larger side
+    // until the plan is back inside it. The window itself is never shrunk.
+    while (allowedWidth.toLong() * allowedHeight > totalPixels && (allowedWidth > visible.width || allowedHeight > visible.height)) {
+        if (allowedWidth >= allowedHeight && allowedWidth > visible.width) allowedWidth--
+        else if (allowedHeight > visible.height) allowedHeight--
+        else allowedWidth--
+    }
+    val coveredWidth = (visible.width * margin).roundToInt().coerceIn(visible.width, allowedWidth)
+    val coveredHeight = (visible.height * margin).roundToInt().coerceIn(visible.height, allowedHeight)
+    val left = (visible.x + visible.width / 2 - coveredWidth / 2).coerceIn(0, native.width - coveredWidth)
+    val top = (visible.y + visible.height / 2 - coveredHeight / 2).coerceIn(0, native.height - coveredHeight)
+    var columns = ceilingDivide(coveredWidth, maximumSide).coerceAtLeast(1)
+    var rows = ceilingDivide(coveredHeight, maximumSide).coerceAtLeast(1)
+    while (tileSide(coveredWidth, columns).toLong() * tileSide(coveredHeight, rows) > maximumPixels) {
+        if (tileSide(coveredWidth, columns) >= tileSide(coveredHeight, rows)) columns++ else rows++
+    }
+    return buildList(columns * rows) {
+        for (row in 0 until rows) {
+            val y0 = top + coveredHeight * row / rows
+            val y1 = top + coveredHeight * (row + 1) / rows
+            for (column in 0 until columns) {
+                val x0 = left + coveredWidth * column / columns
+                val x1 = left + coveredWidth * (column + 1) / columns
+                add(NativeRegion(x0, y0, x1 - x0, y1 - y0))
+            }
+        }
+    }
+}
+
+/** First planned tile no retained crop and no failed request already covers. */
+internal fun missingNativeRegion(
+    tiles: List<NativeRegion>,
+    covered: List<NativeRegion>,
+    failed: List<NativeRegion>,
+): NativeRegion? = tiles.firstOrNull { tile ->
+    (covered.asSequence() + failed.asSequence()).none { it.contains(tile) }
+}
+
+/** Exact area of [visible] covered by [regions]. Overlap is counted once, so a gap cannot hide. */
+internal fun coveredNativeArea(regions: List<NativeRegion>, visible: NativeRegion): Long {
+    if (visible.width <= 0 || visible.height <= 0) return 0L
+    val windowLeft = visible.x.toLong()
+    val windowRight = windowLeft + visible.width
+    val windowTop = visible.y.toLong()
+    val windowBottom = windowTop + visible.height
+    val cuts = buildList {
+        add(windowLeft)
+        add(windowRight)
+        regions.forEach { region ->
+            val left = region.x.toLong().coerceIn(windowLeft, windowRight)
+            val right = (region.x.toLong() + region.width).coerceIn(windowLeft, windowRight)
+            if (right > left) { add(left); add(right) }
+        }
+    }.distinct().sorted()
+    var covered = 0L
+    for (index in 0 until cuts.size - 1) {
+        val stripLeft = cuts[index]
+        val stripRight = cuts[index + 1]
+        if (stripRight <= stripLeft) continue
+        val spans = regions.mapNotNull { region ->
+            val left = region.x.toLong()
+            val right = left + region.width
+            if (right <= stripLeft || left >= stripRight) return@mapNotNull null
+            val top = region.y.toLong().coerceIn(windowTop, windowBottom)
+            val bottom = (region.y.toLong() + region.height).coerceIn(windowTop, windowBottom)
+            if (bottom > top) top to bottom else null
+        }.sortedBy { it.first }
+        var stripCovered = 0L
+        var currentTop = -1L
+        var currentBottom = -1L
+        spans.forEach { (top, bottom) ->
+            if (bottom <= currentBottom) return@forEach
+            if (top > currentBottom) {
+                stripCovered += currentBottom - currentTop
+                currentTop = top
+                currentBottom = bottom
+            } else currentBottom = bottom
+        }
+        if (currentBottom > currentTop) stripCovered += currentBottom - currentTop
+        covered += (stripRight - stripLeft) * stripCovered
+    }
+    return covered
+}
+
+/** Fraction of [visible] already covered by retained crops, exactly, never by sampling. */
+internal fun regionCoverage(regions: List<NativeRegion>, visible: NativeRegion): Float {
+    if (regions.isEmpty() || visible.width <= 0 || visible.height <= 0) return 0f
+    val total = visible.width.toLong() * visible.height
+    return (coveredNativeArea(regions, visible).toDouble() / total).coerceAtMost(1.0).toFloat()
+}
+
+/**
+ * Screen rectangle of a native [region] for a fitted [native] in [area]. Edges are rounded once,
+ * from the native edge, so two adjacent tiles share the exact same screen column: rounding each
+ * width on its own used to leave a one-pixel gap where the upscaled preview showed through as a
+ * line across the photograph.
+ */
+internal fun regionPlacement(region: NativeRegion, native: IntSize, area: IntSize): RegionPlacement {
+    if (native.width <= 0 || native.height <= 0 || area.width <= 0 || area.height <= 0) return RegionPlacement(0, 0, 0, 0)
+    val factor = minOf(area.width.toFloat() / native.width, area.height.toFloat() / native.height)
+    val boxWidth = (native.width * factor).roundToInt().coerceAtLeast(1)
+    val boxHeight = (native.height * factor).roundToInt().coerceAtLeast(1)
+    val left = ((area.width - boxWidth) / 2f).roundToInt()
+    val top = ((area.height - boxHeight) / 2f).roundToInt()
+    val x0 = left + (region.x * factor).roundToInt()
+    val y0 = top + (region.y * factor).roundToInt()
+    val x1 = left + ((region.x + region.width) * factor).roundToInt()
+    val y1 = top + ((region.y + region.height) * factor).roundToInt()
+    return RegionPlacement(x0, y0, (x1 - x0).coerceAtLeast(1), (y1 - y0).coerceAtLeast(1))
 }
 
 /** Newest first, trimmed to a pixel budget that always keeps the newest crop. */
@@ -1707,28 +1866,26 @@ private fun PhotoImage(
                         role = Role.Image
                     }) {
                         val native = nativeSize ?: IntSize(current.bitmap.width, current.bitmap.height)
-                        val factor = minOf(size.width / native.width, size.height / native.height)
-                        val boxWidth = (native.width * factor).roundToInt().coerceAtLeast(1)
-                        val boxHeight = (native.height * factor).roundToInt().coerceAtLeast(1)
-                        val left = ((size.width - boxWidth) / 2f).roundToInt()
-                        val top = ((size.height - boxHeight) / 2f).roundToInt()
+                        // Preview and tiles are placed on the same rounding grid, from the native
+                        // edges outwards, so a tile can never leave a one-pixel line of preview.
+                        val area = IntSize(size.width.roundToInt().coerceAtLeast(1), size.height.roundToInt().coerceAtLeast(1))
+                        val box = regionPlacement(NativeRegion(0, 0, native.width, native.height), native, area)
                         drawImage(
                             image = current.bitmap,
                             srcOffset = IntOffset.Zero,
                             srcSize = IntSize(current.bitmap.width, current.bitmap.height),
-                            dstOffset = IntOffset(left, top),
-                            dstSize = IntSize(boxWidth, boxHeight),
+                            dstOffset = IntOffset(box.x, box.y),
+                            dstSize = IntSize(box.width, box.height),
                             filterQuality = filterQuality,
                         )
                         regions.forEach { nativeRegion ->
-                            val regionWidth = (nativeRegion.width * factor).roundToInt().coerceAtLeast(1)
-                            val regionHeight = (nativeRegion.height * factor).roundToInt().coerceAtLeast(1)
+                            val placed = regionPlacement(nativeRegion.region, native, area)
                             drawImage(
                                 image = nativeRegion.bitmap,
                                 srcOffset = IntOffset.Zero,
                                 srcSize = IntSize(nativeRegion.bitmap.width, nativeRegion.bitmap.height),
-                                dstOffset = IntOffset(left + (nativeRegion.x * factor).roundToInt(), top + (nativeRegion.y * factor).roundToInt()),
-                                dstSize = IntSize(regionWidth, regionHeight),
+                                dstOffset = IntOffset(placed.x, placed.y),
+                                dstSize = IntSize(placed.width, placed.height),
                                 filterQuality = FilterQuality.None,
                             )
                         }
@@ -2223,7 +2380,7 @@ private fun DetailImageArea(
     LaunchedEffect(photo.id, regionsActive) { if (!regionsActive) regions = emptyList() }
     LaunchedEffect(photo.id, regionsActive, viewportSize, nativeSize, preparedBitmap) {
         if (!regionsActive) return@LaunchedEffect
-        var requested: NativeRegion? = null
+        var failed = emptyList<NativeRegion>()
         var requestedFrom = pan
         var requestedZoom = zoom
         var issued = false
@@ -2231,18 +2388,24 @@ private fun DetailImageArea(
             val native = nativeSize
             val restingPan = pan
             val restingZoom = zoom
-            val visible = visibleNativeRegion(viewportSize, native, restingZoom, restingPan, margin = 1f) ?: break
-            // Leading edge: ask as soon as the window is not fully covered, not after the gesture stops.
-            val target = if (regionCoverage(regions.map(RegionView::region), visible) >= 1f) null else visibleNativeRegion(
+            // Coverage is judged on the uncapped window: a window taller than one crop would
+            // otherwise look covered while a band of the frame still showed the upscaled preview.
+            val visible = visibleNativeWindow(viewportSize, native, restingZoom, restingPan) ?: break
+            val covered = regions.map(RegionView::region)
+            val tiles = if (regionCoverage(covered, visible) >= 1f) emptyList() else visibleNativeRegions(
                 viewportSize, native, restingZoom, restingPan, DETAIL_REGION_MARGIN,
                 lead = if (requestedZoom == restingZoom) detailRegionLead(Offset(restingPan.x - requestedFrom.x, restingPan.y - requestedFrom.y), viewportSize) else Offset.Zero,
             )
-            if (target == null || target == requested) {
-                // Nothing new to ask for until the view moves; conflation happens here.
+            // Leading edge: ask for the first tile of the window that no crop covers yet. A tile
+            // already covered by a retained crop is never asked for again.
+            val target = missingNativeRegion(tiles, covered, failed)
+            if (target == null) {
+                // Nothing new to ask for until the view moves; conflation happens here. A crop that
+                // failed is retried after the view moves, never in a loop against the decoder.
+                failed = emptyList()
                 snapshotFlow { pan to zoom }.first { it.first != restingPan || it.second != restingZoom }
                 continue
             }
-            requested = target
             requestedFrom = restingPan
             requestedZoom = restingZoom
             if (issued) kotlinx.coroutines.delay(DETAIL_REGION_MIN_SPACING_MS)
@@ -2253,12 +2416,18 @@ private fun DetailImageArea(
                 throw cancelled
             } catch (_: Throwable) {
                 null
-            } ?: continue
+            }
+            if (bitmap == null) {
+                failed = failed + target
+                continue
+            }
             // Applied as soon as it lands, mid-drag included, and kept for the rest of the inspection.
+            // The budget never evicts the plan that covers the window being looked at.
+            val budget = maxOf(DETAIL_REGION_BUDGET_PIXELS, tiles.sumOf { it.width.toLong() * it.height })
             val added = RegionView(bitmap, target.x, target.y, target.width, target.height)
             regions = retainRegions(listOf(added) + regions.filterNot {
                 it.x == added.x && it.y == added.y && it.width == added.width && it.height == added.height
-            })
+            }, budget)
         }
     }
     val effectiveBitmap = preparedBitmap
