@@ -13,6 +13,10 @@ import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.UUID
 
+private const val MAX_RECOVERABLE_AUTHORITY_BYTES = 64 * 1024 * 1024
+
+internal class LibraryReadChangedException(message: String) : IllegalStateException(message)
+
 /**
  * A library root pinned by a directory descriptor. Every write-mode lookup and rename is
  * relative to SecureDirectoryStream handles and every directory component is opened with
@@ -75,8 +79,9 @@ internal class SecureLibraryBoundary(
         require(attrs.isRegularFile && attrs.size() in 1..maximum.toLong()) { "Unsafe or oversized library file" }
         val expected = readExpectation(attrs)
         val first = readAttestedBytes(directory, name, relative, expected)
-        val second = readAttestedBytes(directory, name, relative, expected)
-        require(first.contentEquals(second)) { "Library file content was not stable across independent reads" }
+        require(matchesAttestedBytes(directory, name, relative, expected, first)) {
+            "Library file content was not stable across independent reads"
+        }
         first
     }
 
@@ -125,6 +130,19 @@ internal class SecureLibraryBoundary(
             runCatching { Files.deleteIfExists(destination) }
             throw failure
         }
+    }
+
+    fun <T> withAttestedRead(
+        relative: String,
+        maximum: Long,
+        expected: ReadExpectation? = null,
+        block: (FileChannel, ReadExpectation) -> T,
+    ): T = withParent(relative) { directory, name, _ ->
+        val attrs = attributes(directory, name) ?: throw NoSuchFileException(relative)
+        if (!attrs.isRegularFile || attrs.size() !in 1..maximum) throw IllegalArgumentException("Unsafe or oversized library file")
+        val observed = readExpectation(attrs)
+        if (expected != null && observed != expected) throw LibraryReadChangedException("Library entry changed before attested read")
+        withAttestedReadChannel(directory, name, relative, observed) { channel -> block(channel, observed) }
     }
 
     fun readExpectation(relative: String): ReadExpectation? = attributes(relative)?.let(::readExpectation)
@@ -176,13 +194,15 @@ internal class SecureLibraryBoundary(
                     syncDirectory(directory, "authority-to-previous")
                     authorityDisplaced?.invoke()
                     if (!matchesExpectation(directory, previous, parent, expectedEntry) || !readFrom(directory, previous, previousBytes.size.coerceAtLeast(1) + 1).contentEquals(previousBytes)) {
+                        val displacedBytes = readFrom(directory, previous, MAX_RECOVERABLE_AUTHORITY_BYTES + 1)
+                        require(displacedBytes.size <= MAX_RECOVERABLE_AUTHORITY_BYTES) { "Concurrent authority exceeds the recovery limit" }
                         val conflict = uniqueArtifact(directory, name, "conflict", artifactExtension)
                         directory.move(Path.of(previous), directory, Path.of(conflict))
                         recoverySource = conflict
                         previous = null
                         syncDirectory(directory, "previous-to-conflict")
-                        restore(directory, conflict, name, previousBytes)
-                        error("Authority changed during replacement; recovery artifact retained")
+                        restore(directory, conflict, name, displacedBytes)
+                        error("Authority changed during replacement; concurrent authority restored and recovery artifact retained")
                     }
                     require(attributes(directory, name) == null) { "Concurrent authority appeared before installation" }
                     beforeCommit?.invoke()
@@ -194,6 +214,11 @@ internal class SecureLibraryBoundary(
                 } catch (failure: Exception) {
                     recoverFailedInstallation(directory, name, parent, installationMoved, installedEntry, bytes, recoverySource, previousBytes, failure)
                     throw failure
+                }
+                val obsolete = checkNotNull(previous)
+                if (attributes(directory, obsolete) != null) {
+                    directory.deleteFile(Path.of(obsolete))
+                    syncDirectory(directory, "previous-cleanup")
                 }
             } finally {
                 if (attributes(directory, temp) != null) {
@@ -445,6 +470,28 @@ internal class SecureLibraryBoundary(
         bytes
     }
 
+    private fun matchesAttestedBytes(
+        directory: SecureDirectoryStream<Path>,
+        name: String,
+        relative: String,
+        expected: ReadExpectation,
+        expectedBytes: ByteArray,
+    ): Boolean = withAttestedReadChannel(directory, name, relative, expected) { channel ->
+        val buffer = ByteBuffer.allocate(1024 * 1024)
+        var offset = 0
+        while (offset < expectedBytes.size) {
+            buffer.clear()
+            buffer.limit(minOf(buffer.capacity(), expectedBytes.size - offset))
+            val count = channel.read(buffer)
+            if (count <= 0) return@withAttestedReadChannel false
+            for (index in 0 until count) if (buffer.get(index) != expectedBytes[offset + index]) {
+                return@withAttestedReadChannel false
+            }
+            offset += count
+        }
+        channel.read(ByteBuffer.allocate(1)) < 0
+    }
+
     /**
      * Ties the opened channel to the descriptor-relative directory entry by holding a
      * shared lock on it and probing a second opening. The JVM reports an overlapping lock
@@ -458,7 +505,9 @@ internal class SecureLibraryBoundary(
         expected: ReadExpectation,
         block: (FileChannel) -> T,
     ): T {
-        require(attributes(directory, name)?.let(::readExpectation) == expected) { "Library entry changed before opening" }
+        if (attributes(directory, name)?.let(::readExpectation) != expected) {
+            throw LibraryReadChangedException("Library entry changed before opening")
+        }
         readOpeningObserver?.invoke(relative)
         val input = directory.newByteChannel(Path.of(name), setOf(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) as? FileChannel
             ?: error("Attested file reads require FileChannel")
@@ -468,7 +517,9 @@ internal class SecureLibraryBoundary(
                 heldLock = opened.tryLock(0L, Long.MAX_VALUE, true)
                     ?: error("Shared file locking is unavailable for attested reads")
                 readOpenedObserver?.invoke(relative)
-                require(attributes(directory, name)?.let(::readExpectation) == expected) { "Library entry changed after opening" }
+                if (attributes(directory, name)?.let(::readExpectation) != expected) {
+                    throw LibraryReadChangedException("Library entry changed after opening")
+                }
                 val witness = directory.newByteChannel(Path.of(name), setOf(StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)) as? FileChannel
                     ?: error("Attested witness reads require FileChannel")
                 witness.use { second ->
@@ -482,11 +533,15 @@ internal class SecureLibraryBoundary(
                     } finally {
                         runCatching { witnessLock?.release() }
                     }
-                    require(sameEntry) { "Opened channel does not match the observed library entry" }
+                    if (!sameEntry) throw LibraryReadChangedException("Opened channel does not match the observed library entry")
                 }
-                require(attributes(directory, name)?.let(::readExpectation) == expected) { "Library entry changed during attestation" }
+                if (attributes(directory, name)?.let(::readExpectation) != expected) {
+                    throw LibraryReadChangedException("Library entry changed during attestation")
+                }
                 return block(opened).also {
-                    require(attributes(directory, name)?.let(::readExpectation) == expected) { "Library entry changed during read" }
+                    if (attributes(directory, name)?.let(::readExpectation) != expected) {
+                        throw LibraryReadChangedException("Library entry changed during read")
+                    }
                 }
             } finally {
                 runCatching { heldLock?.release() }

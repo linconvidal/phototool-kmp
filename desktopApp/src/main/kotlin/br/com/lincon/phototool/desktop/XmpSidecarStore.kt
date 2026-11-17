@@ -4,15 +4,21 @@ import br.com.lincon.phototool.domain.*
 import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.Node
+import java.io.ByteArrayInputStream
+import java.io.StringReader
 import java.nio.charset.Charset
 import java.nio.file.*
 import java.security.MessageDigest
 import javax.xml.XMLConstants
 import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.parsers.SAXParserFactory
 import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
+import org.xml.sax.Attributes
+import org.xml.sax.InputSource
+import org.xml.sax.helpers.DefaultHandler
 
 private const val RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 private const val XMP = "http://ns.adobe.com/xap/1.0/"
@@ -20,7 +26,7 @@ private const val XMP_DM = "http://ns.adobe.com/xmp/1.0/DynamicMedia/"
 private const val DC = "http://purl.org/dc/elements/1.1/"
 private const val LR = "http://ns.adobe.com/lightroom/1.0/"
 private const val CRS = "http://ns.adobe.com/camera-raw-settings/1.0/"
-private const val MAX_XMP_BYTES = 16 * 1024 * 1024
+private const val MAX_XMP_BYTES = 64 * 1024 * 1024
 
 private val HDR_CONTROLS = listOf("SDRBrightness", "SDRContrast", "SDRClarity", "SDRHighlights", "SDRShadows", "SDRWhites", "SDRBlend")
 private val DEVELOP_FIELDS = setOf("Exposure2012", "CameraProfile", "CameraProfileDigest", "WhiteBalance", "HDREditMode", "HDRMaxValue") + HDR_CONTROLS
@@ -37,6 +43,12 @@ data class DevelopSettings(
 
 class XmpException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 internal data class XmpDevelopSnapshot(val settings: DevelopSettings, val contentDigest: String)
+internal data class AuthorityEditorialSnapshot(val state: EditorialState, val revision: String)
+internal sealed interface CurrentEditorialMutation {
+    data class Conflict(val authoritative: AuthorityEditorialSnapshot) : CurrentEditorialMutation
+    data class Persisted(val authoritative: AuthorityEditorialSnapshot) : CurrentEditorialMutation
+}
+private data class MutatedDocument(val document: XmpDocument, val revision: String)
 
 /**
  * Adjacent sidecar store. Java NIO has no portable rename-exchange primitive, so
@@ -55,6 +67,14 @@ class XmpSidecarStore internal constructor(
 
     fun read(photo: Photo): EditorialState = readWithSharedListings(photo, null)
 
+    internal fun readSnapshot(photo: Photo): AuthorityEditorialSnapshot = withPhotoLock(photo) {
+        validatePinnedMedia(photo)
+        val sidecar = sidecar(photo)
+        validateReadableTopology(photo, sidecar)
+        val bytes = if (secure.exists(photo.authorityPath)) secure.read(photo.authorityPath, MAX_XMP_BYTES) else baseXmp()
+        AuthorityEditorialSnapshot(parseEditorial(bytes), digestHex(bytes))
+    }
+
     internal fun readWithSharedListings(
         photo: Photo,
         sharedListings: MutableMap<String, List<SecureLibraryBoundary.Entry>>?,
@@ -63,7 +83,7 @@ class XmpSidecarStore internal constructor(
         val sidecar = sidecar(photo)
         validateReadableTopology(photo, sidecar, sharedListings)
         if (!secure.exists(photo.authorityPath)) EditorialState()
-        else parse(secure.read(photo.authorityPath, MAX_XMP_BYTES)).state()
+        else parseEditorial(secure.read(photo.authorityPath, MAX_XMP_BYTES))
     }
 
     fun readDevelop(photo: Photo): DevelopSettings = withPhotoLock(photo) {
@@ -89,13 +109,37 @@ class XmpSidecarStore internal constructor(
         digestHex(bytes) == snapshot.contentDigest
     }
 
-    fun mutate(photo: Photo, desired: EditorialState, canonicalizeFlag: Boolean = false): EditorialState {
-        val normalized = desired.copy(keywords = desired.keywords.map(::normalizeKeyword).distinctBy(::keywordCasefold))
-        require(normalized.rating in 0..5 && normalized.keywords.size <= 256)
-        return mutateDocument(photo) { document ->
+    fun mutate(photo: Photo, desired: EditorialState, canonicalizeFlag: Boolean = false): EditorialState =
+        when (val result = mutateCurrent(photo, expected = null, canonicalizeFlag) { desired }) {
+            is CurrentEditorialMutation.Conflict -> error("Unconditional editorial mutation conflicted")
+            is CurrentEditorialMutation.Persisted -> result.authoritative.state
+        }
+
+    internal fun mutateCurrent(
+        photo: Photo,
+        expected: ((AuthorityEditorialSnapshot) -> Boolean)?,
+        canonicalizeFlag: Boolean = false,
+        transform: (EditorialState) -> EditorialState,
+    ): CurrentEditorialMutation {
+        var conflict: EditorialState? = null
+        var applied = false
+        val installed = mutateDocumentSnapshot(photo) { document, originalRevision ->
             val current = document.state()
-            document.applyEditorial(current, normalized, canonicalizeFlag)
-        }.state()
+            if (expected?.invoke(AuthorityEditorialSnapshot(current, originalRevision)) == false) {
+                conflict = current
+                false
+            } else {
+                applied = true
+                val transformed = transform(current)
+                val desired = transformed.copy(
+                    keywords = transformed.keywords.map(::normalizeKeyword).distinctBy(::keywordCasefold),
+                )
+                require(desired.rating in 0..5 && desired.keywords.size <= 256)
+                document.applyEditorial(current, desired, canonicalizeFlag)
+            }
+        }
+        return conflict?.let { CurrentEditorialMutation.Conflict(AuthorityEditorialSnapshot(it, installed.revision)) }
+            ?: CurrentEditorialMutation.Persisted(AuthorityEditorialSnapshot(installed.document.state(), installed.revision)).also { check(applied) }
     }
 
     fun mutateDevelop(photo: Photo, desired: DevelopSettings): DevelopSettings {
@@ -122,7 +166,17 @@ class XmpSidecarStore internal constructor(
         return mutateDocument(photo, sourceStillCurrent) { document -> document.applyDevelop(updates) }
     }
 
-    private fun mutateDocument(photo: Photo, sourceStillCurrent: (() -> Boolean)? = null, update: (XmpDocument) -> Boolean): XmpDocument {
+    private fun mutateDocument(
+        photo: Photo,
+        sourceStillCurrent: (() -> Boolean)? = null,
+        update: (XmpDocument) -> Boolean,
+    ): XmpDocument = mutateDocumentSnapshot(photo, sourceStillCurrent) { document, _ -> update(document) }.document
+
+    private fun mutateDocumentSnapshot(
+        photo: Photo,
+        sourceStillCurrent: (() -> Boolean)? = null,
+        update: (XmpDocument, String) -> Boolean,
+    ): MutatedDocument {
         check(writeEnabled) { "Launch with --enable-write to permit XMP changes" }
         check(photo.writable) { photo.issue ?: "Ambiguous photo is not writable" }
         val sidecar = sidecar(photo)
@@ -136,7 +190,8 @@ class XmpSidecarStore internal constructor(
             val document = parse(original)
             document.state()
             document.developState()
-            if (!update(document)) return@withPhotoLock document
+            val originalRevision = digestHex(original)
+            if (!update(document, originalRevision)) return@withPhotoLock MutatedDocument(document, originalRevision)
             val updated = serialize(document)
             check(updated.size in 1..MAX_XMP_BYTES)
             // Parse and validate every managed property before touching the directory.
@@ -156,10 +211,11 @@ class XmpSidecarStore internal constructor(
                     check(sourceStillCurrent?.invoke() != false) { "Transfer source changed before XMP publication" }
                 },
             )
-            val installed = parse(secure.read(relative, MAX_XMP_BYTES))
+            val installedBytes = secure.read(relative, MAX_XMP_BYTES)
+            val installed = parse(installedBytes)
             installed.state()
             installed.developState()
-            installed
+            MutatedDocument(installed, digestHex(installedBytes))
         }
     }
 
@@ -238,6 +294,29 @@ class XmpSidecarStore internal constructor(
 
     override fun close() { secure.close() }
 
+    private fun parseEditorial(bytes: ByteArray): EditorialState = try {
+        val factory = SAXParserFactory.newInstance().apply {
+            isNamespaceAware = true
+            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            setFeature("http://xml.org/sax/features/external-general-entities", false)
+            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+        }
+        val handler = StreamingEditorialHandler()
+        factory.newSAXParser().xmlReader.apply {
+            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            setFeature("http://xml.org/sax/features/external-general-entities", false)
+            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+            runCatching { setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "") }.getOrThrow()
+            entityResolver = org.xml.sax.EntityResolver { _, _ -> InputSource(StringReader("")) }
+            contentHandler = handler
+            errorHandler = handler
+            parse(InputSource(ByteArrayInputStream(bytes)))
+        }
+        handler.result()
+    } catch (error: Exception) {
+        if (error is XmpException) throw error else throw XmpException("Malformed XMP", error)
+    }
+
     private fun parse(bytes: ByteArray): XmpDocument {
         val style = XmlStyle.detect(bytes)
         if (style.decode(bytes).contains("<!DOCTYPE", true)) throw XmpException("DOCTYPE is forbidden")
@@ -283,6 +362,162 @@ class XmpSidecarStore internal constructor(
     private fun digest(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).contentToString()
     private fun digestHex(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
     private fun baseXmp() = """<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="$RDF"><rdf:Description rdf:about="" xmlns:xmp="$XMP" xmlns:xmpDM="$XMP_DM"/></rdf:RDF></x:xmpmeta>""".toByteArray()
+}
+
+private class StreamingEditorialHandler : DefaultHandler() {
+    private data class Name(val namespace: String, val local: String)
+    private data class Collector(val name: Name, val depth: Int, val text: StringBuilder = StringBuilder(), var oversized: Boolean = false)
+    private data class KeywordContext(
+        val name: Name,
+        val propertyDepth: Int,
+        var propertyChildren: Int = 0,
+        var bagDepth: Int? = null,
+        var itemDepth: Int? = null,
+        var itemCount: Int = 0,
+        var itemText: StringBuilder = StringBuilder(),
+        var itemOversized: Boolean = false,
+        val values: MutableList<String> = mutableListOf(),
+        val seen: MutableSet<String> = mutableSetOf(),
+    )
+
+    private val scalarNames = setOf(Name(XMP_DM, "pick"), Name(XMP_DM, "good"), Name(XMP, "Rating"), Name(XMP, "Label"))
+    private val keywordNames = setOf(Name(DC, "subject"), Name(LR, "hierarchicalSubject"))
+    private val scalars = mutableMapOf<Name, MutableList<String>>()
+    private val keywordArrays = mutableMapOf<Name, MutableList<List<String>>>()
+    private val collectors = ArrayDeque<Collector>()
+    private var keyword: KeywordContext? = null
+    private var depth = 0
+    private var descriptions = 0
+
+    override fun startElement(uri: String, localName: String, qName: String, attributes: Attributes) {
+        depth++
+        val name = Name(uri, localName)
+        keyword?.let { context ->
+            when {
+                depth == context.propertyDepth + 1 -> {
+                    context.propertyChildren++
+                    if (context.propertyChildren != 1 || name != Name(RDF, "Bag")) throw XmpException("Keyword array must use rdf:Bag")
+                    context.bagDepth = depth
+                }
+                context.bagDepth != null && depth == context.bagDepth!! + 1 -> {
+                    context.itemCount++
+                    if (name != Name(RDF, "li") || attributes.length != 0 || context.itemDepth != null || context.itemCount > 256) {
+                        throw XmpException("Unsupported keyword items")
+                    }
+                    context.itemDepth = depth
+                    context.itemText = StringBuilder()
+                    context.itemOversized = false
+                }
+                context.itemDepth != null && depth > context.itemDepth!! -> throw XmpException("Unsupported keyword items")
+                else -> throw XmpException("Keyword array must use rdf:Bag")
+            }
+        }
+        if (name == Name(RDF, "Description")) {
+            descriptions++
+            scalarNames.forEach { scalar ->
+                attributes.getValue(scalar.namespace, scalar.local)?.let { addScalar(scalar, it) }
+            }
+        }
+        if (name in keywordNames) {
+            if (keyword != null) throw XmpException("Keyword array must use rdf:Bag")
+            keyword = KeywordContext(name, depth)
+        } else if (name in scalarNames) {
+            collectors.addLast(Collector(name, depth))
+        }
+    }
+
+    override fun characters(characters: CharArray, start: Int, length: Int) {
+        keyword?.takeIf { it.itemDepth != null }?.let { context ->
+            if (!context.itemOversized) {
+                if (context.itemText.length + length <= 1024) context.itemText.append(characters, start, length)
+                else context.itemOversized = true
+            }
+        }
+        collectors.lastOrNull()?.let { collector ->
+            if (!collector.oversized) {
+                if (collector.text.length + length <= 1024) collector.text.append(characters, start, length)
+                else collector.oversized = true
+            }
+        }
+    }
+
+    override fun endElement(uri: String, localName: String, qName: String) {
+        collectors.lastOrNull()?.takeIf { it.depth == depth }?.let { collector ->
+            collectors.removeLast()
+            addScalar(collector.name, if (collector.oversized) "__phototool_oversized_value__" else collector.text.toString())
+        }
+        keyword?.let { context ->
+            when {
+                context.itemDepth == depth -> {
+                    if (!context.itemOversized) {
+                        val normalized = runCatching { normalizeKeyword(context.itemText.toString()) }.getOrNull()
+                        if (normalized != null) {
+                            val folded = keywordCasefold(normalized)
+                            if (!context.seen.add(folded)) throw XmpException("Duplicate managed keyword")
+                            context.values += normalized
+                        }
+                    }
+                    context.itemDepth = null
+                }
+                context.propertyDepth == depth -> {
+                    if (context.propertyChildren != 1 || context.bagDepth == null || context.itemDepth != null) {
+                        throw XmpException("Keyword array must use rdf:Bag")
+                    }
+                    keywordArrays.getOrPut(context.name) { mutableListOf() } += context.values.toList()
+                    keyword = null
+                }
+            }
+        }
+        depth--
+    }
+
+    fun result(): EditorialState {
+        if (descriptions == 0) throw XmpException("XMP must contain rdf:Description")
+        if (keyword != null || collectors.isNotEmpty()) throw XmpException("Malformed managed XMP")
+        fun scalar(name: Name): String? {
+            val values = scalars[name].orEmpty()
+            if (values.distinct().size > 1) throw XmpException("Conflicting managed XMP ${name.local} values")
+            return values.firstOrNull()
+        }
+
+        val pickRaw = scalar(Name(XMP_DM, "pick"))
+        val pick = pickRaw?.takeIf { it.length <= 64 && it.matches(Regex("[+-]?[0-9]+")) }?.toIntOrNull()
+            ?: if (pickRaw == null) null else throw XmpException("Unsupported pick value")
+        val flag = when (pick) {
+            null, 0 -> Flag.UNFLAGGED
+            1 -> Flag.PICK
+            -1 -> Flag.REJECT
+            else -> throw XmpException("Unsupported pick value")
+        }
+        val goodValues = scalars[Name(XMP_DM, "good")].orEmpty()
+        val managedGood = goodValues.mapNotNull { raw -> when (raw.lowercase()) { "true" -> true; "false" -> false; else -> null } }.distinct()
+        if (managedGood.size > 1) throw XmpException("Conflicting managed XMP good values")
+        val good = managedGood.singleOrNull()
+        val goodError = if (goodValues.any { it.lowercase() !in setOf("true", "false") }) "xmp-good-invalid" else null
+        val ratingRaw = scalar(Name(XMP, "Rating"))
+        val parsedRating = ratingRaw?.toIntOrNull() ?: if (ratingRaw == null) 0 else throw XmpException("Malformed rating")
+        val rating = if (parsedRating == -1) 0 else parsedRating
+        if (rating !in 0..5) throw XmpException("Unsupported rating")
+        val labels = scalars[Name(XMP, "Label")].orEmpty().mapNotNull { raw ->
+            when (raw) { "Red" -> ColorLabel.RED; "Yellow" -> ColorLabel.YELLOW; "Green" -> ColorLabel.GREEN; else -> null }
+        }.distinct()
+        if (labels.size > 1) throw XmpException("Conflicting managed XMP Label values")
+
+        val output = mutableListOf<String>()
+        val observed = mutableSetOf<String>()
+        keywordNames.forEach { name ->
+            val projections = keywordArrays[name].orEmpty()
+            val folded = projections.map { values -> values.map(::keywordCasefold) }
+            if (folded.distinct().size > 1) throw XmpException("Conflicting managed keyword arrays")
+            projections.firstOrNull().orEmpty().forEach { value -> if (observed.add(keywordCasefold(value))) output += value }
+        }
+        if (output.size > 256) throw XmpException("Managed keyword union exceeds the limit")
+        return EditorialState(flag, rating, labels.singleOrNull(), output, good, goodError)
+    }
+
+    private fun addScalar(name: Name, value: String) {
+        scalars.getOrPut(name) { mutableListOf() } += value
+    }
 }
 
 private data class XmlStyle(val charset: Charset, val encodingName: String, val declaration: Boolean, val bom: ByteArray, val newline: String) {
@@ -352,7 +587,11 @@ private class XmpDocument(val document: Document, val style: XmlStyle) {
         val good = managedGood.singleOrNull()
         val goodError = if (goodValues.any { it.lowercase() !in setOf("true", "false") }) "xmp-good-invalid" else null
         val ratingRaw = value(XMP, "Rating")
-        val rating = ratingRaw?.toIntOrNull() ?: if (ratingRaw == null) 0 else throw XmpException("Malformed rating")
+        val parsedRating = ratingRaw?.toIntOrNull() ?: if (ratingRaw == null) 0 else throw XmpException("Malformed rating")
+        // XMP defines -1 as a valid rejection marker. PhotoTool keeps rejection in its
+        // independent flag field, so expose this as zero stars while preserving -1 bytes
+        // until the user explicitly changes the rating.
+        val rating = if (parsedRating == -1) 0 else parsedRating
         if (rating !in 0..5) throw XmpException("Unsupported rating")
         val labels = rawValues(XMP, "Label").mapNotNull { raw -> when (raw) { "Red" -> ColorLabel.RED; "Yellow" -> ColorLabel.YELLOW; "Green" -> ColorLabel.GREEN; else -> null } }.distinct()
         if (labels.size > 1) throw XmpException("Conflicting managed XMP Label values")
@@ -406,6 +645,7 @@ private class XmpDocument(val document: Document, val style: XmlStyle) {
                 if (observed.add(keywordCasefold(normalized))) output += normalized
             }
         }
+        if (output.size > 256) throw XmpException("Managed keyword union exceeds the limit")
         return output
     }
 

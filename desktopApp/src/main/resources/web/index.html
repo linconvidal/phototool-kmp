@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#100d0a">
+  <title>PhotoTool</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#gallery">Ir para as fotografias</a>
+  <header class="topbar">
+    <div class="brand-block">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>PhotoTool</h1>
+        <p id="snapshot-status">Abrindo snapshot…</p>
+      </div>
+    </div>
+    <button id="sync-button" class="icon-action" type="button" aria-label="Sincronizar biblioteca explicitamente" title="Sincronizar biblioteca">
+      <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M18.5 6.2A8 8 0 0 0 5 8l-2-2v6h6L6.6 9.6A5.5 5.5 0 0 1 17 11h2.5c-.1-1.8-.7-3.4-1-4.8ZM15 12l2.4 2.4A5.5 5.5 0 0 1 7 13H4.5c.1 1.8.7 3.4 1 4.8A8 8 0 0 0 19 16l2 2v-6h-6Z"/></svg>
+    </button>
+  </header>
+
+  <main>
+    <section class="search-tools" aria-label="Busca e filtros">
+      <label class="search-field">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m20.5 19-4.8-4.8a7.4 7.4 0 1 0-1.5 1.5l4.8 4.8 1.5-1.5ZM5.1 10a4.9 4.9 0 1 1 9.8 0 4.9 4.9 0 0 1-9.8 0Z"/></svg>
+        <span class="visually-hidden">Buscar fotografias</span>
+        <input id="search-input" name="q" type="search" enterkeyhint="search" autocomplete="off" placeholder='Buscar, excluir com -termo ou -"frase"'>
+      </label>
+      <button id="filters-button" class="filter-button" type="button" aria-expanded="false" aria-controls="filters-panel">
+        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 6h10v2H4V6Zm16 1a3 3 0 1 1-6 0 3 3 0 0 1 6 0ZM10 16h10v2H10v-2ZM4 17a3 3 0 1 1 6 0 3 3 0 0 1-6 0Z"/></svg>
+        Filtros <span id="filter-count" class="count-badge" hidden>0</span>
+      </button>
+    </section>
+
+    <section id="filters-panel" class="filters-panel" aria-label="Filtros da galeria" hidden>
+      <label>Keyword<select id="filter-keyword" data-param="keyword"><option value="">Todas</option></select></label>
+      <label>De<input id="filter-from" data-param="fromDate" type="date"></label>
+      <label>Até<input id="filter-to" data-param="toDate" type="date"></label>
+      <label>Flag<select id="filter-flag" data-param="flag"><option value="">Todas</option><option value="PICK">Escolhida</option><option value="UNFLAGGED">Sem flag</option><option value="REJECT">Rejeitada</option></select></label>
+      <label>Câmera<select id="filter-camera" data-param="camera"><option value="">Todas</option></select></label>
+      <label>Lente<select id="filter-lens" data-param="lens"><option value="">Todas</option></select></label>
+      <label>Estrelas mínimas<select id="filter-stars" data-param="minimumStars"><option value="">Qualquer</option><option value="1">1+</option><option value="2">2+</option><option value="3">3+</option><option value="4">4+</option><option value="5">5</option></select></label>
+      <label>GPS<select id="filter-gps" data-param="gps"><option value="">Qualquer</option><option value="PRESENT">Com GPS</option><option value="MISSING">Sem GPS</option></select></label>
+      <label>Pasta<select id="filter-folder" data-param="folder"><option value="">Todas</option></select></label>
+      <label>Ordem<select id="filter-sort" data-param="sort"><option value="CAPTURE_TIME">Data de captura</option><option value="RECENTLY_ADDED">Adição recente</option></select></label>
+      <button id="clear-filters" class="quiet-button" type="button">Limpar filtros</button>
+    </section>
+
+    <div class="results-heading">
+      <p id="result-count" aria-live="polite">Carregando fotografias…</p>
+      <p id="query-hint">Busca e filtros são aplicados no servidor.</p>
+    </div>
+
+    <section id="gallery" class="gallery" aria-label="Galeria de fotografias" aria-busy="true"></section>
+    <div id="empty-state" class="empty-state" hidden>
+      <p>Nenhuma fotografia neste recorte.</p>
+      <button id="empty-clear" class="quiet-button" type="button">Limpar busca e filtros</button>
+    </div>
+    <nav class="pagination" aria-label="Páginas da galeria">
+      <button id="previous-page" type="button">Anterior</button>
+      <span id="page-status">Página 1</span>
+      <button id="next-page" type="button">Próxima</button>
+    </nav>
+  </main>
+
+  <dialog id="detail-dialog" class="detail-dialog" aria-labelledby="detail-title">
+    <div class="detail-shell">
+      <header class="detail-header">
+        <button id="close-detail" class="icon-action" type="button" aria-label="Fechar detalhe">
+          <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6.4 4.9 1.5-1.5 8.7 8.6-8.7 8.6-1.5-1.5 7.2-7.1-7.2-7.1Z"/></svg>
+        </button>
+        <div><p id="detail-format"></p><h2 id="detail-title">Fotografia</h2></div>
+        <div class="detail-neighbors">
+          <button id="previous-photo" class="icon-action" type="button" aria-label="Fotografia anterior">‹</button>
+          <button id="next-photo" class="icon-action" type="button" aria-label="Próxima fotografia">›</button>
+        </div>
+      </header>
+      <div class="detail-content">
+        <figure class="detail-stage"><img id="detail-image" alt=""><figcaption id="detail-image-status">Prévia JPEG bounded</figcaption></figure>
+        <aside class="inspector">
+          <section class="editorial-section" aria-labelledby="editorial-title">
+            <div class="section-heading"><h3 id="editorial-title">Curadoria</h3><span id="write-state"></span></div>
+            <fieldset id="flag-controls" class="segmented"><legend>Flag</legend>
+              <button type="button" data-flag="REJECT" aria-label="Marcar como rejeitada">×</button>
+              <button type="button" data-flag="UNFLAGGED" aria-label="Remover flag">•</button>
+              <button type="button" data-flag="PICK" aria-label="Marcar como escolhida">✓</button>
+            </fieldset>
+            <fieldset id="rating-controls" class="stars"><legend>Estrelas</legend>
+              <button type="button" data-rating="1" aria-label="Uma estrela">★</button><button type="button" data-rating="2" aria-label="Duas estrelas">★</button><button type="button" data-rating="3" aria-label="Três estrelas">★</button><button type="button" data-rating="4" aria-label="Quatro estrelas">★</button><button type="button" data-rating="5" aria-label="Cinco estrelas">★</button><button class="clear-rating" type="button" data-rating="0" aria-label="Remover estrelas">0</button>
+            </fieldset>
+            <fieldset id="label-controls" class="labels"><legend>Label</legend>
+              <button type="button" data-label="RED" aria-label="Label vermelha"><span class="label-dot red"></span></button>
+              <button type="button" data-label="YELLOW" aria-label="Label amarela"><span class="label-dot yellow"></span></button>
+              <button type="button" data-label="GREEN" aria-label="Label verde"><span class="label-dot green"></span></button>
+              <button type="button" data-label="" aria-label="Remover label">Sem cor</button>
+            </fieldset>
+            <div class="keyword-editor">
+              <div id="keyword-list" class="keyword-list" aria-label="Keywords"></div>
+              <form id="keyword-form"><label><span class="visually-hidden">Nova keyword</span><input id="keyword-input" maxlength="160" autocomplete="off" placeholder="Adicionar keyword"></label><button type="submit">Adicionar</button></form>
+            </div>
+          </section>
+          <section class="metadata-section" aria-labelledby="metadata-title"><h3 id="metadata-title">Metadata observada</h3><dl id="metadata-list"></dl></section>
+        </aside>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

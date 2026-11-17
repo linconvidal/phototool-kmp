@@ -115,6 +115,7 @@ internal class UnlockWatcher(
 
 fun main(args: Array<String>) {
     if (args.firstOrNull() == "archive") exitProcess(runArchiveCli(args))
+    if (args.firstOrNull() == "web") exitProcess(runWebServer(args.drop(1).toTypedArray()))
     val options = parseArguments(args)
     if (options.smoke) {
         val code = runCatching { SmokeHarness.run(options) }.fold({ 0 }, { error -> System.err.println("smoke-error: ${error.message?.take(300)}"); 2 })
@@ -178,12 +179,35 @@ internal class CoalescedEditController(
     ): Long {
         val key = RequestKey(context, photo.id)
         val generation = generations.computeIfAbsent(key) { AtomicLong() }.incrementAndGet()
-        pending[key] = Request(context, generation, photo, desired, rollback, persist, confirmed, updateCache)
+        val incoming = Request(context, generation, photo, desired, rollback, persist, confirmed, updateCache)
+        pending.compute(key) { _, queued ->
+            if (queued == null) incoming
+            else incoming.copy(photo = incoming.photo.copy(editorial = queued.photo.editorial), rollback = queued.rollback)
+        }
         if (scheduled.add(key)) executor.execute { drain(key) }
         return generation
     }
 
     fun isCurrent(context: String, id: String, generation: Long): Boolean = generations[RequestKey(context, id)]?.get() == generation
+
+    private fun rebasePending(key: RequestKey, authoritative: EditorialState) {
+        pending.computeIfPresent(key) { _, queued ->
+            val rebasedDesired = mergeEditorial(queued.photo.editorial, queued.desired, authoritative)
+            queued.copy(photo = queued.photo.copy(editorial = authoritative), desired = rebasedDesired, rollback = authoritative)
+        }
+    }
+
+    fun retireContext(context: String) {
+        generations.keys.removeIf { it.context == context }
+        pending.keys.removeIf { it.context == context }
+        scheduled.removeIf { it.context == context }
+        lastConfirmed.keys.removeIf { it.context == context }
+    }
+
+    fun acceptAuthoritative(context: String, photos: List<Photo>) {
+        lastConfirmed.keys.removeIf { it.context == context }
+        photos.forEach { photo -> lastConfirmed[RequestKey(context, photo.id)] = photo.editorial }
+    }
 
     private fun drain(key: RequestKey) {
         try {
@@ -191,12 +215,22 @@ internal class CoalescedEditController(
                 val request = pending.remove(key) ?: break
                 val persisted = runCatching { request.persist(request.photo, request.desired) }
                 if (persisted.isFailure) {
-                    val rollback = lastConfirmed[key] ?: request.rollback
-                    if (isCurrent(request.context, key.photoId, request.generation)) completed(request.context, key.photoId, request.generation, rollback, WriteState.FAILED, "Falha ao salvar no XMP; o último estado confirmado foi restaurado")
+                    val partial = persisted.exceptionOrNull() as? ProjectionUpdateAfterXmpException
+                    if (partial != null) {
+                        lastConfirmed[key] = partial.authoritative
+                        rebasePending(key, partial.authoritative)
+                        request.confirmed(key.photoId, partial.authoritative)
+                        if (isCurrent(request.context, key.photoId, request.generation)) completed(request.context, key.photoId, request.generation, partial.authoritative, WriteState.FAILED, "XMP salvo, mas o cache editorial não pôde ser atualizado")
+                    } else {
+                        val rollback = lastConfirmed[key] ?: request.rollback
+                        rebasePending(key, rollback)
+                        if (isCurrent(request.context, key.photoId, request.generation)) completed(request.context, key.photoId, request.generation, rollback, WriteState.FAILED, "Falha ao salvar no XMP; o último estado confirmado foi restaurado")
+                    }
                     continue
                 }
                 val authoritative = persisted.getOrThrow()
                 lastConfirmed[key] = authoritative
+                rebasePending(key, authoritative)
                 request.confirmed(key.photoId, authoritative)
                 val cached = runCatching { request.updateCache(key.photoId, authoritative) }
                 if (cached.isFailure) {
@@ -234,14 +268,15 @@ internal class EditorialRevisionLedger {
         return next
     }
 
-    @Synchronized fun overlayWithRevision(photos: List<Photo>): Pair<List<Photo>, Long> =
-        photos.map { photo -> confirmed[photo.id]?.let { photo.copy(editorial = it.editorial) } ?: photo } to revision
-
     @Synchronized fun overlay(photos: List<Photo>): List<Photo> =
         photos.map { photo -> confirmed[photo.id]?.let { photo.copy(editorial = it.editorial) } ?: photo }
 
-    @Synchronized fun changesAfter(baseRevision: Long, ids: Set<String>): List<Pair<String, EditorialState>> =
-        confirmed.asSequence().filter { (id, value) -> id in ids && value.revision > baseRevision }.map { (id, value) -> id to value.editorial }.toList()
+    @Synchronized fun acceptAuthoritative(photos: List<Photo>): List<Photo> {
+        confirmed.clear()
+        photos.forEach { photo -> confirmed[photo.id] = Confirmed(0L, photo.editorial) }
+        revision = 0L
+        return photos
+    }
 
     @Synchronized fun overlayAndAccept(photos: List<Photo>): List<Photo> {
         val reconciled = photos.map { photo -> confirmed[photo.id]?.let { photo.copy(editorial = it.editorial) } ?: photo }
@@ -253,25 +288,6 @@ internal class EditorialRevisionLedger {
 }
 
 internal data class ReconciledPublication(val photos: List<Photo>, val warning: String? = null)
-
-internal fun publishReconciledSnapshot(
-    cache: PhotoCache,
-    observed: List<Photo>,
-    ledger: EditorialRevisionLedger,
-    beforePublish: () -> Unit = {},
-): ReconciledPublication {
-    ledger.seedMissing(observed)
-    val (prepared, preparedRevision) = ledger.overlayWithRevision(observed)
-    beforePublish()
-    cache.publish(prepared)
-    val ids = observed.mapTo(hashSetOf()) { it.id }
-    val replayWarning = runCatching {
-        ledger.changesAfter(preparedRevision, ids).forEach { (id, editorial) -> cache.updateEditorial(id, editorial) }
-    }.exceptionOrNull()?.let { "Snapshot publicado; uma edição confirmada precisa ser reconciliada do XMP" }
-    val confirmed = cache.load()
-    check(confirmed.map { it.id }.toSet() == observed.map { it.id }.toSet()) { "Published cache could not be confirmed" }
-    return ReconciledPublication(confirmed, replayWarning)
-}
 
 internal fun summaryWarning(save: () -> Unit): String? = runCatching(save).exceptionOrNull()?.let { "Snapshot publicado; não foi possível atualizar o resumo da sincronização" }
 
@@ -319,6 +335,7 @@ internal class DesktopController(
         val previews: PreviewStore,
         val summaries: SyncSummaryStore,
         val auxiliary: AuxiliaryActions,
+        val editorialPersistence: EditorialPersistenceService,
         val ledger: EditorialRevisionLedger,
         val snapshot: List<Photo>,
         val status: SyncStatus,
@@ -338,6 +355,7 @@ internal class DesktopController(
     private var previews: PreviewStore? = null
     private var summaries: SyncSummaryStore? = null
     private var auxiliary = AuxiliaryActions()
+    private var editorialPersistence: EditorialPersistenceService? = null
     private val libraryResources = java.util.concurrent.CopyOnWriteArrayList<AutoCloseable>()
     private val sessionCounter = AtomicLong()
     private val configurationCounter = AtomicLong()
@@ -387,25 +405,36 @@ internal class DesktopController(
             shortcutScopeFocused = { shortcutScopeFocused = it },
         )
 
+    private fun loadConsistentCacheSnapshot(cache: PhotoCache): List<Photo> {
+        repeat(3) {
+            val before = runCatching { cache.persistedGeneration() }.getOrNull()
+            val loaded = cache.loadCacheOnly()
+            val after = runCatching { cache.persistedGeneration() }.getOrNull()
+            if (before == after) return loaded
+        }
+        return emptyList()
+    }
+
     private fun prepareServices(selected: Path, newSession: LibrarySessionDescriptor): PreparedServices {
         val newResources = mutableListOf<AutoCloseable>()
         try {
-            val newCache = PhotoCache(cachePath, selected)
+            val newCache = PhotoCache(cachePath, selected, validateLibraryDescendantsOnOpen = false, createCacheIfMissing = true)
             val newXmp = XmpSidecarStore(selected, true).also(newResources::add)
-            val newPreviews = PreviewStore(selected, cachePath).also(newResources::add)
+            val newPreviews = PreviewStore(selected, cachePath, validateLibraryDescendantsOnOpen = false).also(newResources::add)
             val newSummaries = SyncSummaryStore(cachePath)
             val newFuji = FujiProfileStore(selected, true).also(newResources::add)
             val newAuxiliary = DesktopAuxiliaryActions(newXmp, newFuji) {
                 sessionWriteEnabled && librarySession == newSession.context && rootIdentityMatches(selected, newSession.rootKey)
             }.callbacks()
-            val sharedSnapshotListings = HashMap<String, List<SecureLibraryBoundary.Entry>>()
-            val snapshot = newCache.load().map { photo ->
-                runCatching { photo.copy(editorial = newXmp.readWithSharedListings(photo, sharedSnapshotListings)) }.getOrElse { photo.copy(issue = photo.issue ?: "XMP read failed: ${it.message}", writable = false) }
-            }
+            val newPersistence = EditorialPersistenceService(
+                XmpEditorialAuthority(newXmp),
+                PhotoCacheProjection(newCache),
+            )
+            val snapshot = loadConsistentCacheSnapshot(newCache)
             val newLedger = EditorialRevisionLedger().also { it.seedMissing(snapshot) }
             val lastSummary = runCatching { newSummaries.load() }.getOrNull()
             val newStatus = syncStatusFromSummary(lastSummary, snapshot, newCache.snapshotGeneration())
-            return PreparedServices(selected, newSession, newResources, newCache, newXmp, newPreviews, newSummaries, newAuxiliary, newLedger, snapshot, newStatus)
+            return PreparedServices(selected, newSession, newResources, newCache, newXmp, newPreviews, newSummaries, newAuxiliary, newPersistence, newLedger, snapshot, newStatus)
         } catch (failure: Exception) {
             newResources.asReversed().forEach { runCatching { it.close() } }
             throw failure
@@ -419,6 +448,7 @@ internal class DesktopController(
         previews = prepared.previews
         summaries = prepared.summaries
         auxiliary = prepared.auxiliary
+        editorialPersistence = prepared.editorialPersistence
         editorialLedger = prepared.ledger
         library = prepared.selected
         librarySession = prepared.session.context
@@ -461,12 +491,14 @@ internal class DesktopController(
     private fun scheduleLibraryConfiguration(selectedPath: Path) {
         val request = configurationCounter.incrementAndGet()
         pendingConfiguration = request
+        val retiredContext = librarySession
         librarySession = null // immediately invalidates queued writes for the old root
         state = state.copy(sync = SyncStatus(SyncPhase.DISCOVERING, running = true, message = "Preparando biblioteca e cache fora da interface"))
         worker.submit {
             val prepared = runCatching {
                 configurationObserver?.invoke(Thread.currentThread().name)
                 drainEditorialWrites()
+                retiredContext?.let(edits::retireContext)
                 val candidate = selectedPath.toAbsolutePath().normalize()
                 val selected = (if (Files.isDirectory(candidate, LinkOption.NOFOLLOW_LINKS)) candidate else candidate.parent ?: candidate).toRealPath()
                 prepareServices(selected, nextLibrarySession(selected))
@@ -506,14 +538,14 @@ internal class DesktopController(
     private fun synchronize() {
         val root = library ?: return
         if (state.sync.running) return
-        cancelled = AtomicBoolean(false)
-        state = state.copy(sync = SyncStatus(SyncPhase.DISCOVERING, running = true, message = "Iniciando sincronização"))
         val flightCache = cache ?: return
         val flightXmp = xmp ?: return
         val flightSummaries = summaries
         val flightSession = librarySession ?: return
         val flightRootKey = libraryRootKey ?: return
         val flightLedger = editorialLedger
+        cancelled = AtomicBoolean(false)
+        state = state.copy(sync = SyncStatus(SyncPhase.DISCOVERING, running = true, message = "Iniciando sincronização"))
         val previousErrors = state.sync.errors
         val startedNanos = System.nanoTime()
         worker.submit {
@@ -533,8 +565,28 @@ internal class DesktopController(
             fun savePreviousOutcome(outcome: String, errors: Int, errorCode: String) {
                 summary(outcome, previousSnapshot, previousGeneration, errors, errorCode)?.let { value -> runCatching { flightSummaries?.save(value) } }
             }
+            val progressRelay = object {
+                private val latest = java.util.concurrent.atomic.AtomicReference<SyncStatus?>()
+                private val scheduled = AtomicBoolean(false)
+
+                fun submit(progress: SyncStatus) {
+                    latest.set(progress)
+                    schedule()
+                }
+
+                private fun schedule() {
+                    if (!scheduled.compareAndSet(false, true)) return
+                    scope.launch {
+                        latest.getAndSet(null)?.let { progress ->
+                            if (librarySession == flightSession) state = state.copy(sync = progress)
+                        }
+                        scheduled.set(false)
+                        if (latest.get() != null) schedule()
+                    }
+                }
+            }
             val scanned = try {
-                LibraryScanner().scan(root, cancelled) { progress -> scope.launch { if (librarySession == flightSession) state = state.copy(sync = progress) } }
+                LibraryScanner().scan(root, cancelled, progressRelay::submit)
             } catch (_: InterruptedException) {
                 savePreviousOutcome("cancelled", previousErrors, "cancelled")
                 scope.launch { if (librarySession == flightSession) state = state.copy(sync = state.sync.copy(phase = SyncPhase.CANCELLED, running = false, message = "Sincronização cancelada. O snapshot anterior foi preservado")) }
@@ -545,20 +597,9 @@ internal class DesktopController(
                 return@submit
             }
             var xmpFailures = 0
-            val sharedXmpListings = HashMap<String, List<SecureLibraryBoundary.Entry>>()
             val observed = try {
                 if (cancelled.get()) throw InterruptedException()
-                scanned.photos.mapIndexed { index, photo ->
-                    if (cancelled.get()) throw InterruptedException()
-                    val xmpRead = runCatching { flightXmp.readWithSharedListings(photo, sharedXmpListings) }
-                    val indexed = if (xmpRead.isSuccess) photo.copy(editorial = xmpRead.getOrThrow()) else {
-                        xmpFailures++
-                        photo.copy(writable = false, issue = "Unsafe or malformed XMP")
-                    }
-                    scope.launch { if (librarySession == flightSession) state = state.copy(sync = state.sync.copy(phase = SyncPhase.INDEXING, photos = index + 1, totalPhotos = scanned.photos.size, message = "Lendo ajustes editoriais")) }
-                    indexed
-                }.also {
-                    if (cancelled.get()) throw InterruptedException()
+                scanned.photos.also {
                     check(immutableFlightMayPublish(root, library) && librarySession == flightSession && rootIdentityMatches(root, flightRootKey)) { "library-flight-changed" }
                 }
             } catch (_: InterruptedException) {
@@ -570,15 +611,55 @@ internal class DesktopController(
                 scope.launch { if (librarySession == flightSession) state = state.copy(sync = state.sync.copy(phase = SyncPhase.FAILED, running = false, message = "${error.message?.take(120) ?: "Falha na sincronização"}. O snapshot anterior foi preservado")) }
                 return@submit
             }
-            val totalErrors = scanned.errors + xmpFailures
             scope.launch { if (librarySession == flightSession) state = state.copy(sync = state.sync.copy(phase = SyncPhase.PUBLISHING, running = true, message = "Publicando snapshot validado")) }
             val publication = try {
-                publishReconciledSnapshot(flightCache, observed, flightLedger)
+                flightCache.withExclusiveProjection {
+                    val sharedXmpListings = HashMap<String, List<SecureLibraryBoundary.Entry>>()
+                    xmpFailures = 0
+                    val authoritativeObserved = observed.mapIndexed { index, photo ->
+                        if (cancelled.get()) throw InterruptedException()
+                        val xmpRead = runCatching { flightXmp.readWithSharedListings(photo, sharedXmpListings) }
+                        val indexed = if (xmpRead.isSuccess) photo.copy(editorial = xmpRead.getOrThrow()) else {
+                            xmpFailures++
+                            photo.copy(writable = false, issue = "Unsafe or malformed XMP")
+                        }
+                        progressRelay.submit(SyncStatus(SyncPhase.INDEXING, photos = index + 1, running = true, message = "Lendo ajustes editoriais", totalPhotos = observed.size))
+                        indexed
+                    }
+                    if (xmpFailures > 0) flightCache.markProjectionDegraded()
+                    flightCache.publish(authoritativeObserved)
+                    val confirmed = flightCache.load()
+                    check(confirmed.associate { it.id to it.editorial } == authoritativeObserved.associate { it.id to it.editorial }) {
+                        "Published editorial projection could not be confirmed"
+                    }
+                    flightLedger.acceptAuthoritative(confirmed)
+                    edits.acceptAuthoritative(flightSession, confirmed)
+                    ReconciledPublication(confirmed).also {
+                        if (xmpFailures == 0) flightCache.clearProjectionDegraded()
+                    }
+                }
             } catch (error: Exception) {
-                savePreviousOutcome("failed", totalErrors, syncErrorCode(error))
-                scope.launch { if (librarySession == flightSession) state = state.copy(sync = state.sync.copy(phase = SyncPhase.FAILED, running = false, message = "${error.message?.take(120) ?: "Falha ao publicar"}. O snapshot anterior foi preservado")) }
+                savePreviousOutcome("failed", scanned.errors + xmpFailures, syncErrorCode(error))
+                val recovered = runCatching {
+                    val actual = flightCache.load()
+                    check(flightCache.snapshotGeneration() != null)
+                    flightLedger.acceptAuthoritative(actual)
+                }.getOrNull()
+                scope.launch {
+                    if (librarySession == flightSession) {
+                        val actualState = recovered?.let(flightLedger::overlayAndAccept)
+                        state = (actualState?.let { reduce(state, Action.PublishSnapshot(it)) } ?: state).copy(
+                            sync = state.sync.copy(
+                                phase = SyncPhase.FAILED,
+                                running = false,
+                                message = "${error.message?.take(120) ?: "Falha ao publicar"}. O snapshot persistido foi revalidado",
+                            ),
+                        )
+                    }
+                }
                 return@submit
             }
+            val totalErrors = scanned.errors + xmpFailures
             val completedSummary = summary(
                 "success",
                 publication.photos,
@@ -624,8 +705,7 @@ internal class DesktopController(
         val flightSession = librarySession ?: return
         val rollback = flightLedger.confirmed(photo.id) ?: current.editorial
         state = reduce(state, Action.EditorialChanged(photo.id, merged, WriteState.SAVING))
-        val store = xmp ?: return
-        val flightCache = cache
+        val persistence = editorialPersistence ?: return
         edits.submit(
             photo = current,
             desired = merged,
@@ -633,15 +713,12 @@ internal class DesktopController(
             rollback = rollback,
             persist = { source, editorial ->
                 check(rootIdentityMatches(flightRoot, flightRootKey)) { "Library root identity changed before editorial write" }
-                store.mutate(source, editorial, canonicalizeFlag).also {
+                persistence.persistAndProject(source, editorial, canonicalizeFlag || source.editorial.flag != editorial.flag).also {
                     check(rootIdentityMatches(flightRoot, flightRootKey)) { "Library root identity changed during editorial write" }
                 }
             },
             confirmed = flightLedger::record,
-            updateCache = { id, editorial ->
-                check(rootIdentityMatches(flightRoot, flightRootKey)) { "Library root identity changed before cache update" }
-                flightCache?.updateEditorial(id, editorial)
-            },
+            updateCache = { _, _ -> Unit },
         )
     }
 
@@ -714,21 +791,23 @@ internal object SmokeHarness {
         val xmp = XmpSidecarStore(library, false)
         val previews = PreviewStore(library, options.cache)
         try {
-            val scanned = LibraryScanner().scan(library, AtomicBoolean()) { }
-            var xmpFailures = 0
-            val photos = scanned.photos.map { photo -> runCatching { photo.copy(editorial = xmp.read(photo)) }.getOrElse { xmpFailures++; photo.copy(writable = false, issue = it.message) } }
-            val previewFailures = photos.count { !previews.verify(it) }
-            val metadataErrors = photos.count { it.metadata.status == MetadataStatus.ERROR }
-            check(photos.isNotEmpty()) { "No supported media was verified" }
-            check(previewFailures == 0) { "Required previews failed verification" }
-            check(metadataErrors == 0) { "Required metadata failed verification" }
-            check(xmpFailures == 0) { "Required XMP sidecars failed verification" }
-            cache.publish(photos)
-            val loaded = cache.load()
-            check(loaded.size == photos.size) { "Published cache count mismatch" }
-            val summary = "{\"photos\":${photos.size},\"metadataErrors\":$metadataErrors,\"xmpFailures\":$xmpFailures,\"previewFailures\":$previewFailures,\"cacheReloaded\":${loaded.size},\"xmpWrites\":0}"
-            check(summary.length < 1024)
-            println(summary)
+            cache.withExclusiveProjection {
+                val scanned = LibraryScanner().scan(library, AtomicBoolean()) { }
+                var xmpFailures = 0
+                val photos = scanned.photos.map { photo -> runCatching { photo.copy(editorial = xmp.read(photo)) }.getOrElse { xmpFailures++; photo.copy(writable = false, issue = it.message) } }
+                val previewFailures = photos.count { !previews.verify(it) }
+                val metadataErrors = photos.count { it.metadata.status == MetadataStatus.ERROR }
+                check(photos.isNotEmpty()) { "No supported media was verified" }
+                check(previewFailures == 0) { "Required previews failed verification" }
+                check(metadataErrors == 0) { "Required metadata failed verification" }
+                check(xmpFailures == 0) { "Required XMP sidecars failed verification" }
+                cache.publish(photos)
+                val loaded = cache.load()
+                check(loaded.size == photos.size) { "Published cache count mismatch" }
+                val summary = "{\"photos\":${photos.size},\"metadataErrors\":$metadataErrors,\"xmpFailures\":$xmpFailures,\"previewFailures\":$previewFailures,\"cacheReloaded\":${loaded.size},\"xmpWrites\":0}"
+                check(summary.length < 1024)
+                println(summary)
+            }
         } finally {
             runCatching { previews.close() }
             runCatching { xmp.close() }
@@ -739,12 +818,25 @@ internal object SmokeHarness {
 internal fun shortcutAllowed(keyDown: Boolean, textInputFocused: Boolean, shortcutScopeFocused: Boolean, ctrl: Boolean, alt: Boolean, meta: Boolean, shift: Boolean): Boolean =
     keyDown && !textInputFocused && shortcutScopeFocused && !ctrl && !alt && !meta && !shift
 
-internal fun mergeEditorial(base: EditorialState, desired: EditorialState, latest: EditorialState): EditorialState = latest.copy(
-    flag = if (desired.flag != base.flag) desired.flag else latest.flag,
-    rating = if (desired.rating != base.rating) desired.rating else latest.rating,
-    label = if (desired.label != base.label) desired.label else latest.label,
-    keywords = if (desired.keywords != base.keywords) desired.keywords else latest.keywords,
-)
+internal fun mergeEditorial(base: EditorialState, desired: EditorialState, latest: EditorialState): EditorialState {
+    val keywords = if (desired.keywords == base.keywords) latest.keywords else {
+        val baseKeys = base.keywords.mapTo(mutableSetOf(), ::keywordCasefold)
+        val desiredKeys = desired.keywords.mapTo(mutableSetOf(), ::keywordCasefold)
+        val removed = baseKeys - desiredKeys
+        val retained = latest.keywords.filterNot { keywordCasefold(it) in removed }.toMutableList()
+        val retainedKeys = retained.mapTo(mutableSetOf(), ::keywordCasefold)
+        desired.keywords.filter { keywordCasefold(it) !in baseKeys }.forEach { keyword ->
+            if (retainedKeys.add(keywordCasefold(keyword))) retained += keyword
+        }
+        retained
+    }
+    return latest.copy(
+        flag = if (desired.flag != base.flag) desired.flag else latest.flag,
+        rating = if (desired.rating != base.rating) desired.rating else latest.rating,
+        label = if (desired.label != base.label) desired.label else latest.label,
+        keywords = keywords,
+    )
+}
 
 internal fun batchMutationPlan(photos: List<Photo>, edit: BatchEdit): List<Pair<Photo, EditorialState>> = photos.asSequence()
     .distinctBy { it.id }
