@@ -3,6 +3,7 @@ package br.com.lincon.phototool.ui
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.snap
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -12,8 +13,8 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.hoverable
 import androidx.compose.foundation.horizontalScroll
@@ -87,6 +88,9 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
@@ -114,7 +118,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import br.com.lincon.phototool.domain.*
 import br.com.lincon.phototool.state.*
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.ensureActive
 import kotlin.math.roundToInt
 
 private val Ink = Color(0xff100d0a)
@@ -341,13 +350,128 @@ fun estimatedMasonryNeighbor(photos: List<Photo>, currentId: String, columns: In
 }
 
 private const val MIN_DETAIL_ZOOM = 1f
-private const val MAX_DETAIL_ZOOM = 8f
-private val detailZoomStops = listOf(1f, 1.25f, 1.5f, 2f, 3f, 4f, 6f, 8f)
+private const val BASE_MAX_DETAIL_ZOOM = 8f
+private const val HARD_MAX_DETAIL_ZOOM = 64f
+private val baseDetailZoomStops = listOf(1f, 1.25f, 1.5f, 2f, 3f, 4f, 6f, 8f)
 
-internal fun nextDetailZoom(current: Float, direction: Int): Float = when {
-    direction > 0 -> detailZoomStops.firstOrNull { it > current + .01f } ?: MAX_DETAIL_ZOOM
-    direction < 0 -> detailZoomStops.lastOrNull { it < current - .01f } ?: MIN_DETAIL_ZOOM
-    else -> current.coerceIn(MIN_DETAIL_ZOOM, MAX_DETAIL_ZOOM)
+/** Zoom at which one image pixel maps to one screen pixel for the current Fit layout. */
+internal fun detailPixelZoom(viewport: IntSize, image: IntSize): Float {
+    if (viewport.width <= 0 || viewport.height <= 0 || image.width <= 0 || image.height <= 0) return BASE_MAX_DETAIL_ZOOM
+    val fit = minOf(viewport.width.toFloat() / image.width, viewport.height.toFloat() / image.height)
+    return (1f / fit).coerceAtLeast(MIN_DETAIL_ZOOM)
+}
+
+/** Enough magnification to inspect the actual pixels, never below the previous 8x ceiling. */
+internal fun detailMaxZoom(pixelZoom: Float): Float =
+    maxOf(BASE_MAX_DETAIL_ZOOM, pixelZoom * 4f).coerceAtMost(HARD_MAX_DETAIL_ZOOM)
+
+internal fun detailZoomStops(pixelZoom: Float): List<Float> {
+    val maximum = detailMaxZoom(pixelZoom)
+    return (baseDetailZoomStops + listOf(pixelZoom, pixelZoom * 2f, pixelZoom * 4f))
+        .filter { it in MIN_DETAIL_ZOOM..maximum }
+        .distinct()
+        .sorted()
+}
+
+/** Nearest-neighbour from the point where pixels start to be inspected; smooth below it. */
+internal fun detailFilterQuality(zoom: Float, pixelZoom: Float): FilterQuality =
+    if (zoom >= maxOf(2f, pixelZoom * .5f)) FilterQuality.None else FilterQuality.Low
+
+internal data class NativeRegion(val x: Int, val y: Int, val width: Int, val height: Int)
+internal data class RegionView(val bitmap: ImageBitmap, val x: Int, val y: Int, val width: Int, val height: Int) {
+    val region: NativeRegion get() = NativeRegion(x, y, width, height)
+}
+
+/** Native margin fetched around the visible window at 1:1, so a drag has sharp pixels ahead. */
+internal const val DETAIL_REGION_MARGIN = 2.6f
+internal const val DETAIL_REGION_BUDGET_PIXELS = 8_000_000L
+/** Floor between two crop requests, so a fast drag conflates instead of flooding the decoder. */
+internal const val DETAIL_REGION_MIN_SPACING_MS = 60L
+
+/** Native-image rectangle currently visible, with margin for panning, bounded for decoding. */
+internal fun visibleNativeRegion(
+    viewport: IntSize,
+    native: IntSize,
+    zoom: Float,
+    pan: Offset,
+    margin: Float = DETAIL_REGION_MARGIN,
+    maximumSide: Int = 2048,
+    maximumPixels: Long = 3_000_000L,
+    lead: Offset = Offset.Zero,
+): NativeRegion? {
+    if (viewport.width <= 0 || viewport.height <= 0 || native.width <= 0 || native.height <= 0 || zoom <= 0f) return null
+    val fit = minOf(viewport.width.toFloat() / native.width, viewport.height.toFloat() / native.height)
+    if (fit <= 0f) return null
+    val left = (viewport.width - native.width * fit) / 2f
+    val top = (viewport.height - native.height * fit) / 2f
+    val center = Offset(viewport.width / 2f, viewport.height / 2f)
+    fun sourceAt(x: Float, y: Float): Offset {
+        val ux = center.x + (x - center.x - pan.x) / zoom
+        val uy = center.y + (y - center.y - pan.y) / zoom
+        return Offset((ux - left) / fit, (uy - top) / fit)
+    }
+    val first = sourceAt(0f, 0f)
+    val second = sourceAt(viewport.width.toFloat(), viewport.height.toFloat())
+    val visibleWidth = kotlin.math.abs(second.x - first.x)
+    val visibleHeight = kotlin.math.abs(second.y - first.y)
+    var width = (visibleWidth * margin).coerceIn(1f, native.width.toFloat())
+    var height = (visibleHeight * margin).coerceIn(1f, native.height.toFloat())
+    if (width > maximumSide) { height *= maximumSide / width; width = maximumSide.toFloat() }
+    if (height > maximumSide) { width *= maximumSide / height; height = maximumSide.toFloat() }
+    while (width * height > maximumPixels) { width *= .9f; height *= .9f }
+    // Lead the drag: bias the margin towards where the view is heading, never beyond half its slack.
+    val leadX = ((width - visibleWidth) / 2f).coerceAtLeast(0f) * lead.x.coerceIn(-1f, 1f)
+    val leadY = ((height - visibleHeight) / 2f).coerceAtLeast(0f) * lead.y.coerceIn(-1f, 1f)
+    val w = width.roundToInt().coerceIn(1, native.width)
+    val h = height.roundToInt().coerceIn(1, native.height)
+    if (w.toLong() * h > maximumPixels) return null
+    // Shift the window instead of shrinking it at the image edges, so the crop still covers the view.
+    val x = ((first.x + second.x) / 2f + leadX - w / 2f).roundToInt().coerceIn(0, native.width - w)
+    val y = ((first.y + second.y) / 2f + leadY - h / 2f).roundToInt().coerceIn(0, native.height - h)
+    return NativeRegion(x, y, w, h)
+}
+
+/** Fraction of [visible] already covered by retained crops, sampled on a small fixed grid. */
+internal fun regionCoverage(regions: List<NativeRegion>, visible: NativeRegion, columns: Int = 3, rows: Int = 4): Float {
+    if (regions.isEmpty() || visible.width <= 0 || visible.height <= 0) return 0f
+    var inside = 0
+    for (row in 0 until rows) for (column in 0 until columns) {
+        val x = visible.x + (visible.width * (column + .5f) / columns).toInt()
+        val y = visible.y + (visible.height * (row + .5f) / rows).toInt()
+        if (regions.any { x >= it.x && x < it.x + it.width && y >= it.y && y < it.y + it.height }) inside++
+    }
+    return inside.toFloat() / (columns * rows)
+}
+
+/** Newest first, trimmed to a pixel budget that always keeps the newest crop. */
+internal fun retainRegions(regions: List<RegionView>, budgetPixels: Long = DETAIL_REGION_BUDGET_PIXELS): List<RegionView> =
+    regions.take(retainedRegionCount(regions.map { it.width.toLong() * it.height }, budgetPixels))
+
+/** How many crops, newest first, fit in [budgetPixels]. The newest one always counts. */
+internal fun retainedRegionCount(pixelSizes: List<Long>, budgetPixels: Long = DETAIL_REGION_BUDGET_PIXELS): Int {
+    var total = 0L
+    var kept = 0
+    for (pixels in pixelSizes) {
+        if (kept > 0 && total + pixels > budgetPixels) break
+        total += pixels
+        kept++
+    }
+    return kept
+}
+
+/** Direction the view is heading, in [-1, 1] per axis, from the pan moved since the last crop. */
+internal fun detailRegionLead(movement: Offset, viewport: IntSize): Offset {
+    val reach = minOf(viewport.width, viewport.height).coerceAtLeast(1) * .3f
+    val magnitude = kotlin.math.sqrt(movement.x * movement.x + movement.y * movement.y)
+    if (magnitude < 1f) return Offset.Zero
+    val scale = (magnitude / reach).coerceIn(0f, 1f) * .75f
+    return Offset(-movement.x / magnitude * scale, -movement.y / magnitude * scale)
+}
+
+internal fun nextDetailZoom(current: Float, direction: Int, stops: List<Float> = baseDetailZoomStops, maximum: Float = BASE_MAX_DETAIL_ZOOM): Float = when {
+    direction > 0 -> stops.firstOrNull { it > current + .01f } ?: maximum
+    direction < 0 -> stops.lastOrNull { it < current - .01f } ?: MIN_DETAIL_ZOOM
+    else -> current.coerceIn(MIN_DETAIL_ZOOM, maximum)
 }
 
 internal fun focalDetailPan(pan: Offset, currentZoom: Float, targetZoom: Float, focalPoint: Offset, viewport: IntSize): Offset {
@@ -367,6 +491,26 @@ internal fun constrainDetailPan(offset: Offset, zoom: Float, viewport: IntSize, 
     return Offset(offset.x.coerceIn(-maximumX, maximumX), offset.y.coerceIn(-maximumY, maximumY))
 }
 
+data class AppCapabilities(
+    val localLibrary: Boolean = true,
+    val synchronize: Boolean = true,
+    val auxiliary: Boolean = true,
+    val calendar: Boolean = true,
+    val folders: Boolean = true,
+    val batchEditorial: Boolean = true,
+) {
+    fun supports(section: LibrarySection): Boolean = when (section) {
+        LibrarySection.CALENDAR -> calendar
+        LibrarySection.FOLDERS -> folders
+        else -> true
+    }
+
+    companion object {
+        val Remote = AppCapabilities(false, false, false, false, false, false)
+        val RemoteReadOnly = Remote
+    }
+}
+
 data class AppCallbacks(
     val dispatch: (Action) -> Unit,
     val chooseLibrary: () -> Unit = {},
@@ -383,12 +527,18 @@ data class AppCallbacks(
     val textFieldFocused: (Boolean) -> Unit = {},
     val shortcutScopeFocused: (Boolean) -> Unit = {},
     val galleryColumnsChanged: (Int) -> Unit = {},
+    val capabilities: AppCapabilities = AppCapabilities(),
+    val refresh: () -> Unit = {},
+    val changePage: (Int) -> Unit = {},
+    val presentDetail: (Int, Boolean) -> Boolean = { _, _ -> false },
 )
 
 @Composable
 fun PhotoToolApp(state: AppState, callbacks: AppCallbacks, modifier: Modifier = Modifier) = PhotoToolTheme {
     Surface(modifier.fillMaxSize().semantics { contentDescription = "Aplicativo PhotoTool" }, color = Ink) {
-        BoxWithConstraints(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Panel.copy(alpha = .34f), Ink, Stage)))) {
+        Column(Modifier.fillMaxSize()) {
+        state.remote?.let { RemoteRecoveryNotice(it, callbacks) }
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(Brush.verticalGradient(listOf(Panel.copy(alpha = .34f), Ink, Stage)))) {
             val appWidth = maxWidth
             val appHeight = maxHeight
             val phonePortrait = appWidth < 600.dp
@@ -414,7 +564,33 @@ fun PhotoToolApp(state: AppState, callbacks: AppCallbacks, modifier: Modifier = 
                 }
             }
         }
+        }
         if (state.helpOpen) ShortcutHelp { callbacks.dispatch(Action.ToggleHelp) }
+    }
+}
+
+@Composable
+private fun RemoteRecoveryNotice(remote: RemoteBrowseState, callbacks: AppCallbacks) {
+    val message = remote.error
+        ?: remote.editorialNotice?.takeIf { remote.editorialNeedsRefresh }
+        ?: if (remote.projection == "DEGRADED") "Snapshot degradado. Edição indisponível." else return
+    Row(Modifier.fillMaxWidth().background(Panel).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            message,
+            color = Danger,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite },
+        )
+        AppIconButton(RefreshVectorIcon, "Atualizar snapshot", callbacks.refresh, enabled = !remote.loading && remote.savingPhotoId == null)
+    }
+}
+
+@Composable
+private fun RemotePagination(remote: RemoteBrowseState, callbacks: AppCallbacks) {
+    Row(Modifier.fillMaxWidth().background(Panel).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+        AppIconButton(ChevronLeft, "Página anterior", { callbacks.changePage(-1) }, enabled = !remote.loading && remote.page > 1)
+        Text("Página ${remote.page} de ${remote.totalPages}", style = ProofAnnotationStyle, color = Muted)
+        AppIconButton(ChevronRight, "Próxima página", { callbacks.changePage(1) }, enabled = !remote.loading && remote.page < remote.totalPages)
     }
 }
 
@@ -436,6 +612,23 @@ private fun LibraryWorkspace(state: AppState, callbacks: AppCallbacks, modifier:
 @Composable
 private fun CompactNavigationBar(state: AppState, callbacks: AppCallbacks) {
     var moreOpen by remember { mutableStateOf(false) }
+    val menuEntries: @Composable () -> Unit = {
+        DropdownMenuItem(
+            text = { Text("Recentes") }, leadingIcon = { Icon(ImageSearch, null) },
+            onClick = { moreOpen = false; callbacks.dispatch(Action.Navigate(LibrarySection.LATEST)) },
+        )
+        DropdownMenuItem(
+            text = { Text("Ajuda de atalhos") }, leadingIcon = { Icon(HelpOutline, null) },
+            onClick = { moreOpen = false; callbacks.dispatch(Action.ToggleHelp) },
+        )
+        DropdownMenuItem(
+            text = { Text("Configurações") }, leadingIcon = { Icon(Settings, null) },
+            onClick = { moreOpen = false; callbacks.dispatch(Action.OpenSettings) },
+        )
+    }
+    Column {
+    // Keep the same menu items in-root on web, avoiding a transient accessibility owner.
+    if (state.remote != null && moreOpen) Column(Modifier.fillMaxWidth().background(Raised)) { menuEntries() }
     Row(
         Modifier.fillMaxWidth().height(64.dp).background(Panel).border(1.dp, Hairline),
         verticalAlignment = Alignment.CenterVertically,
@@ -447,40 +640,33 @@ private fun CompactNavigationBar(state: AppState, callbacks: AppCallbacks) {
             Triple(LibrarySection.PICKS, PickFlag, "Escolhidas"),
         ).forEach { (section, icon, label) ->
             Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                AppIconButton(icon, label, { callbacks.dispatch(Action.Navigate(section)) }, selected = state.section == section && state.screen != Screen.SETTINGS)
+                AppIconButton(icon, label, { callbacks.dispatch(Action.Navigate(section)) }, selected = state.section == section && state.screen != Screen.SETTINGS, enabled = callbacks.capabilities.supports(section))
             }
         }
         Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-            AppIconButton(MoreHoriz, "Mais opções", { moreOpen = true }, selected = moreOpen || state.section == LibrarySection.LATEST || state.screen == Screen.SETTINGS)
-            DropdownMenu(expanded = moreOpen, onDismissRequest = { moreOpen = false }, containerColor = Raised) {
-                DropdownMenuItem(
-                    text = { Text("Recentes") },
-                    leadingIcon = { Icon(ImageSearch, null) },
-                    onClick = { moreOpen = false; callbacks.dispatch(Action.Navigate(LibrarySection.LATEST)) },
-                )
-                DropdownMenuItem(
-                    text = { Text("Ajuda de atalhos") },
-                    leadingIcon = { Icon(HelpOutline, null) },
-                    onClick = { moreOpen = false; callbacks.dispatch(Action.ToggleHelp) },
-                )
-                DropdownMenuItem(
-                    text = { Text("Configurações") },
-                    leadingIcon = { Icon(Settings, null) },
-                    onClick = { moreOpen = false; callbacks.dispatch(Action.OpenSettings) },
-                )
-            }
+            AppIconButton(MoreHoriz, "Mais opções", { moreOpen = !moreOpen }, selected = moreOpen || state.section == LibrarySection.LATEST || state.screen == Screen.SETTINGS)
+            if (state.remote == null) DropdownMenu(expanded = moreOpen, onDismissRequest = { moreOpen = false }, containerColor = Raised) { menuEntries() }
         }
+    }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun RailIconButton(icon: ImageVector, description: String, onClick: () -> Unit, selected: Boolean = false) = TooltipBox(
-    positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-    tooltip = { PlainTooltip(containerColor = Raised, contentColor = TextPrimary) { Text(description) } },
-    state = rememberTooltipState(),
-) {
-    AppIconButton(icon, description, onClick, Modifier.fillMaxWidth(), selected = selected)
+private fun RailIconButton(icon: ImageVector, description: String, onClick: () -> Unit, selected: Boolean = false, enabled: Boolean = true, tooltipEnabled: Boolean = true) {
+    // CMP 1.11 Web has a single accessibility semantics owner; transient tooltip windows
+    // can leave its mirror stale on dismissal. Keep the labeled button in the root on web.
+    if (!tooltipEnabled) {
+        AppIconButton(icon, description, onClick, Modifier.fillMaxWidth(), selected = selected, enabled = enabled)
+        return
+    }
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+        tooltip = { PlainTooltip(containerColor = Raised, contentColor = TextPrimary) { Text(description) } },
+        state = rememberTooltipState(),
+    ) {
+        AppIconButton(icon, description, onClick, Modifier.fillMaxWidth(), selected = selected, enabled = enabled)
+    }
 }
 
 @Composable
@@ -511,13 +697,13 @@ private fun LibraryRail(state: AppState, callbacks: AppCallbacks) = BoxWithConst
         )
         entries.forEach { (section, icon, label) ->
             val active = state.section == section && state.screen != Screen.SETTINGS
-            RailIconButton(icon, label, { callbacks.dispatch(Action.Navigate(section)) }, selected = active)
+            RailIconButton(icon, label, { callbacks.dispatch(Action.Navigate(section)) }, selected = active, enabled = callbacks.capabilities.supports(section), tooltipEnabled = state.remote == null)
             Spacer(Modifier.height(if (compact) 1.dp else 3.dp))
         }
         if (compact) Spacer(Modifier.height(5.dp)) else Spacer(Modifier.weight(1f))
-        RailIconButton(HelpOutline, "Ajuda de atalhos", { callbacks.dispatch(Action.ToggleHelp) })
+        RailIconButton(HelpOutline, "Ajuda de atalhos", { callbacks.dispatch(Action.ToggleHelp) }, tooltipEnabled = state.remote == null)
         Spacer(Modifier.height(if (compact) 1.dp else 3.dp))
-        RailIconButton(Settings, "Configurações", { callbacks.dispatch(Action.OpenSettings) }, selected = state.screen == Screen.SETTINGS)
+        RailIconButton(Settings, "Configurações", { callbacks.dispatch(Action.OpenSettings) }, selected = state.screen == Screen.SETTINGS, tooltipEnabled = state.remote == null)
         Box(
             Modifier.padding(top = if (compact) 4.dp else 8.dp).size(8.dp).background(if (state.writeEnabled) PickGreen else Muted, RoundedCornerShape(4.dp))
                 .semantics { contentDescription = if (state.writeEnabled) "Edição XMP ativada" else "Somente leitura" },
@@ -531,7 +717,7 @@ private fun LibraryToolbar(state: AppState, callbacks: AppCallbacks, searchFocus
         Row(Modifier.fillMaxWidth().height(62.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(if (state.screen == Screen.CALENDAR) "Calendário" else "Pastas", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.width(12.dp))
-            Text(photoCount(state.photos.size), color = Muted, style = ProofAnnotationStyle)
+            Text(photoCount(state.totalPhotoCount), color = Muted, style = ProofAnnotationStyle)
         }
         return@Column
     }
@@ -544,7 +730,7 @@ private fun LibraryToolbar(state: AppState, callbacks: AppCallbacks, searchFocus
         } else Row(Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.widthIn(min = 126.dp, max = 154.dp)) {
                 Text(sectionTitle(state.section), fontWeight = FontWeight.SemiBold, maxLines = 1)
-                Text(photoCount(state.visiblePhotos.size), color = Muted, style = ProofAnnotationStyle)
+                Text(photoCount(state.visiblePhotoCount), color = Muted, style = ProofAnnotationStyle)
             }
             Spacer(Modifier.width(10.dp))
             GallerySearch(state, callbacks, Modifier.widthIn(min = 180.dp, max = 420.dp).weight(1f), searchFocusChanged)
@@ -633,7 +819,7 @@ private fun GalleryToolbarControls(state: AppState, callbacks: AppCallbacks, mod
     Row(modifier.height(if (showSummary) 52.dp else 46.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
         if (showSummary) Column(Modifier.weight(1f).padding(start = 4.dp)) {
             Text(sectionTitle(state.section), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge, maxLines = 1)
-            Text(photoCount(state.visiblePhotos.size), color = Muted, style = ProofAnnotationStyle)
+            Text(photoCount(state.visiblePhotoCount), color = Muted, style = ProofAnnotationStyle)
         }
         OutlinedButton(
             onClick = { callbacks.dispatch(Action.ToggleFilters) },
@@ -739,11 +925,16 @@ private fun FilterPanel(state: AppState, callbacks: AppCallbacks, availableWidth
 @Composable
 private fun GalleryBody(state: AppState, callbacks: AppCallbacks, searchFocused: Boolean, modifier: Modifier) = Box(modifier.fillMaxHeight()) {
     when {
+        state.remote?.loading == true -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.semantics { contentDescription = "Carregando fotografias" }) }
+        state.remote?.error != null -> StatePanel(ErrorOutline, "Falha de conexão", state.remote.error, "Tentar novamente", callbacks.refresh, requestInitialFocus = false)
         state.library == null -> EmptyLibrary(callbacks)
         state.visiblePhotos.isEmpty() -> EmptyGallery(state, callbacks, requestInitialFocus = !searchFocused)
         else -> Column(Modifier.fillMaxSize()) {
             if (state.selectionModeActive) BatchCommandBar(state, callbacks)
-            Box(Modifier.weight(1f).fillMaxWidth()) { PhotoGrid(state, callbacks, searchFocused) }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                key(state.remote?.page, state.remote?.generation) { PhotoGrid(state, callbacks, searchFocused) }
+            }
+            state.remote?.let { RemotePagination(it, callbacks) }
         }
     }
 }
@@ -766,7 +957,7 @@ private fun BatchCommandBar(state: AppState, callbacks: AppCallbacks) = BoxWithC
     val ignoredCount = selected.size - editableCount
     val visibleCount = state.visiblePhotos.size
     val selectionLimitReached = selected.size == MAX_BATCH_PHOTOS && visibleCount > MAX_BATCH_PHOTOS
-    val canMutate = state.writeEnabled && editableCount > 0
+    val canMutate = callbacks.capabilities.batchEditorial && state.writeEnabled && editableCount > 0
     val compact = maxWidth < 1050.dp
     fun requestEditorial(edit: BatchEdit) {
         callbacks.batchMutate(selected, edit)
@@ -1461,7 +1652,6 @@ private fun ProofAnnotation(photo: Photo) = Row(
 private sealed interface PreviewState {
     data object Loading : PreviewState
     data class Loaded(val bitmap: androidx.compose.ui.graphics.ImageBitmap) : PreviewState
-    data object Unavailable : PreviewState
 }
 
 @Composable
@@ -1474,18 +1664,72 @@ private fun PhotoImage(
     issueClicked: (() -> Unit)? = null,
     imageModifier: Modifier = Modifier,
     previewDimensionsChanged: (IntSize) -> Unit = {},
+    preparedBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    nativeSize: IntSize? = null,
+    regions: List<RegionView> = emptyList(),
+    filterQuality: FilterQuality? = null,
 ) {
-    val preview by produceState<PreviewState>(PreviewState.Loading, photo.id, photo.previewIdentity, maximumDimension) {
-        value = callbacks.imageLoader.load(photo, maximumDimension)?.let(PreviewState::Loaded) ?: PreviewState.Unavailable
+    val preview = if (preparedBitmap != null) PreviewState.Loaded(preparedBitmap) else key(
+        photo.id, photo.previewIdentity, photo.presentation?.previewUrl, maximumDimension, callbacks.imageLoader,
+    ) {
+        // produceState retains its old value when only an effect key changes. Never give that
+        // old bitmap the new photo's name, including same-id preview version changes.
+        val loaded by produceState<PreviewState>(PreviewState.Loading) {
+            val bitmap = callbacks.imageLoader.load(photo, maximumDimension)
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            // Sync already proved which photographs have a usable preview and recorded the reason
+            // for the others in the snapshot, so a request that produces no bitmap keeps the frame
+            // in its loading presentation instead of becoming a browsing error.
+            value = bitmap?.let(PreviewState::Loaded) ?: PreviewState.Loading
+        }
+        loaded
     }
     Box(modifier.background(Stage).semantics { contentDescription = "Quadro de ${photo.displayName}" }, contentAlignment = Alignment.Center) {
         when (val current = preview) {
             PreviewState.Loading -> Text("Carregando prévia", color = Muted, modifier = Modifier.semantics { contentDescription = "Carregando prévia de ${photo.displayName}" })
             is PreviewState.Loaded -> {
                 SideEffect { previewDimensionsChanged(IntSize(current.bitmap.width, current.bitmap.height)) }
-                Image(current.bitmap, contentDescription = "Prévia de ${photo.displayName}", modifier = Modifier.fillMaxSize().then(imageModifier), contentScale = scale)
+                val state = "Resolução apresentada: ${current.bitmap.width} × ${current.bitmap.height}"
+                if (filterQuality != null) {
+                    check(scale == ContentScale.Fit) { "Pixel-accurate rendering supports Fit only" }
+                    Canvas(Modifier.fillMaxSize().then(imageModifier).semantics {
+                        contentDescription = "Prévia de ${photo.displayName}"
+                        stateDescription = state
+                        role = Role.Image
+                    }) {
+                        val native = nativeSize ?: IntSize(current.bitmap.width, current.bitmap.height)
+                        val factor = minOf(size.width / native.width, size.height / native.height)
+                        val boxWidth = (native.width * factor).roundToInt().coerceAtLeast(1)
+                        val boxHeight = (native.height * factor).roundToInt().coerceAtLeast(1)
+                        val left = ((size.width - boxWidth) / 2f).roundToInt()
+                        val top = ((size.height - boxHeight) / 2f).roundToInt()
+                        drawImage(
+                            image = current.bitmap,
+                            srcOffset = IntOffset.Zero,
+                            srcSize = IntSize(current.bitmap.width, current.bitmap.height),
+                            dstOffset = IntOffset(left, top),
+                            dstSize = IntSize(boxWidth, boxHeight),
+                            filterQuality = filterQuality,
+                        )
+                        regions.forEach { nativeRegion ->
+                            val regionWidth = (nativeRegion.width * factor).roundToInt().coerceAtLeast(1)
+                            val regionHeight = (nativeRegion.height * factor).roundToInt().coerceAtLeast(1)
+                            drawImage(
+                                image = nativeRegion.bitmap,
+                                srcOffset = IntOffset.Zero,
+                                srcSize = IntSize(nativeRegion.bitmap.width, nativeRegion.bitmap.height),
+                                dstOffset = IntOffset(left + (nativeRegion.x * factor).roundToInt(), top + (nativeRegion.y * factor).roundToInt()),
+                                dstSize = IntSize(regionWidth, regionHeight),
+                                filterQuality = FilterQuality.None,
+                            )
+                        }
+                    }
+                } else {
+                    Image(current.bitmap, contentDescription = "Prévia de ${photo.displayName}", modifier = Modifier.fillMaxSize().then(imageModifier).semantics {
+                        stateDescription = state
+                    }, contentScale = scale)
+                }
             }
-            PreviewState.Unavailable -> Text("Prévia indisponível", color = Muted, modifier = Modifier.semantics { contentDescription = "Prévia indisponível para ${photo.displayName}" })
         }
         if (photo.issue != null || photo.writeError != null || photo.metadata.status == MetadataStatus.ERROR || photo.editorial.goodError != null) Box(
             Modifier.align(Alignment.BottomEnd).padding(7.dp).size(44.dp).clip(RoundedCornerShape(22.dp)).background(Stage.copy(alpha = .82f))
@@ -1566,12 +1810,16 @@ private fun <T> MagneticSelector(
             .pointerInput(enabled, selectedIndex, trackWidth, items.size) {
                 if (!enabled || trackWidth <= 0) return@pointerInput
                 detectHorizontalDragGestures(
-                    onDragStart = { dragging = true; dragPosition = selectedIndex.toFloat() },
+                    onDragStart = { position ->
+                        dragging = true
+                        val segmentWidth = trackWidth.toFloat() / items.size
+                        dragPosition = (position.x / segmentWidth).coerceIn(0f, items.lastIndex.toFloat())
+                    },
                     onDragCancel = { dragging = false },
                     onDragEnd = {
                         val target = dragPosition.roundToInt().coerceIn(items.indices)
                         dragging = false
-                        currentOnSelect(items[target])
+                        if (target != selectedIndex) currentOnSelect(items[target])
                     },
                 ) { change, amount ->
                     change.consume()
@@ -1679,16 +1927,21 @@ private fun EditorialRatingSlider(rating: Int, enabled: Boolean, description: St
     }
 }
 
+private fun canEditPhoto(state: AppState, photo: Photo): Boolean = state.writeEnabled && photo.writable &&
+    (state.remote == null || (state.screen == Screen.DETAIL && !state.remote.loading &&
+        state.remote.savingPhotoId == null && !state.remote.editorialNeedsRefresh &&
+        state.remote.detail?.id == photo.id && photo.editorialRevision != null))
+
 @Composable
 private fun QuickControls(photo: Photo, state: AppState, callbacks: AppCallbacks, modifier: Modifier = Modifier) {
-    EditorialFlagSelector(photo.editorial.flag, state.writeEnabled && photo.writable, modifier) { callbacks.mutateFlag(photo, it) }
+    EditorialFlagSelector(photo.editorial.flag, canEditPhoto(state, photo), modifier) { callbacks.mutateFlag(photo, it) }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun QuickEditor(photo: Photo, state: AppState, callbacks: AppCallbacks, close: () -> Unit) {
     val closeFocusRequester = remember { FocusRequester() }
-    val enabled = state.writeEnabled && photo.writable
+    val enabled = canEditPhoto(state, photo)
     LaunchedEffect(photo.id) { closeFocusRequester.requestFocus() }
     Surface(
         modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Curadoria rápida de ${photo.displayName}" },
@@ -1706,6 +1959,7 @@ private fun QuickEditor(photo: Photo, state: AppState, callbacks: AppCallbacks, 
                 Text(photo.mediaFormatLabel, color = Muted, style = ProofAnnotationStyle, maxLines = 1)
                 AppIconButton(Close, "Fechar curadoria rápida", close, Modifier.focusRequester(closeFocusRequester))
             }
+            if (state.remote != null) Text("Abra a fotografia para editar o XMP.", color = Muted, style = MaterialTheme.typography.bodySmall)
             EditorialFlagSelector(photo.editorial.flag, enabled) { callbacks.mutateFlag(photo, it) }
             EditorialRatingSlider(photo.editorial.rating, enabled, "Avaliação da curadoria rápida") { callbacks.mutate(photo, photo.editorial.copy(rating = it)) }
             EditorialLabelSelector(photo.editorial.label, enabled) { callbacks.mutate(photo, photo.editorial.copy(label = it)) }
@@ -1818,14 +2072,33 @@ private fun HdrControlSlider(photo: Photo, name: String, label: String, hdr: Hdr
     )
 }
 
+private enum class DetailPanel { INSPECTOR, FILMSTRIP }
+
 @Composable
-private fun DetailScreen(state: AppState, callbacks: AppCallbacks) {
+private fun DetailScreen(requestedState: AppState, callbacks: AppCallbacks) {
     val focusRequester = remember { FocusRequester() }
-    val photo = state.selected
+    val presented = remoteDetailPreview(requestedState.remote, callbacks)
+    val state = if (presented == null) requestedState else requestedState.copy(
+        selectedId = presented.photo.id, selectedIds = setOf(presented.photo.id),
+        remote = requestedState.remote?.copy(detail = presented.photo),
+    )
+    val bitmap = presented?.bitmap
+    val photo = state.remote?.detail ?: state.selected
     LaunchedEffect(photo?.id) { focusRequester.requestFocus() }
     BoxWithConstraints(
         Modifier.fillMaxSize().focusRequester(focusRequester).onFocusChanged { callbacks.shortcutScopeFocused(it.hasFocus) }.focusable(),
     ) {
+        if (state.remote?.detail == null && (state.remote?.loading == true || state.remote?.error != null)) {
+            StatePanel(
+                icon = ImageSearch,
+                title = if (state.remote.loading) "Carregando fotografia" else "Fotografia indisponível",
+                message = state.remote.error ?: "Consultando o snapshot do servidor.",
+                actionLabel = "Voltar à biblioteca",
+                action = { callbacks.dispatch(Action.CloseDetail) },
+                requestInitialFocus = false,
+            )
+            return@BoxWithConstraints
+        }
         if (photo == null) {
             StatePanel(
                 icon = ErrorOutline,
@@ -1837,34 +2110,151 @@ private fun DetailScreen(state: AppState, callbacks: AppCallbacks) {
             return@BoxWithConstraints
         }
     val visibleIndex = state.visiblePhotos.indexOfFirst { it.id == photo.id }
-    val previousAvailable = visibleIndex > 0
-    val nextAvailable = visibleIndex >= 0 && visibleIndex < state.visiblePhotos.lastIndex
-    val horizontalInspector = maxWidth >= 900.dp || maxHeight < 640.dp
-    val inspectorWidth = if (maxWidth < 900.dp) 290.dp else 370.dp
-    if (horizontalInspector) {
+    val previousAvailable = state.remote?.let { it.loading || it.previousId != null } ?: (visibleIndex > 0)
+    val nextAvailable = state.remote?.let { it.loading || it.nextId != null } ?: (visibleIndex >= 0 && visibleIndex < state.visiblePhotos.lastIndex)
+    // A short viewport is a reason to disclose tools, never to squeeze a phone beside an inspector.
+    val compact = maxWidth < 900.dp || maxHeight < 480.dp
+    var panel by remember(photo.id, compact) { mutableStateOf<DetailPanel?>(null) }
+    var panelDrag by remember(photo.id, compact) { mutableStateOf<Float?>(null) }
+    if (!compact) {
         Row(Modifier.fillMaxSize()) {
-            DetailImageArea(photo, state, callbacks, Modifier.weight(1f).fillMaxHeight(), previousAvailable, nextAvailable)
-            DetailInspector(photo, state, callbacks, Modifier.width(inspectorWidth).fillMaxHeight())
+            DetailImageArea(photo, state, callbacks, Modifier.weight(1f).fillMaxHeight(), previousAvailable, nextAvailable, preparedBitmap = bitmap)
+            DetailInspector(photo, state, callbacks, Modifier.width(370.dp).fillMaxHeight())
         }
     } else {
-        Column(Modifier.fillMaxSize()) {
-            DetailImageArea(photo, state, callbacks, Modifier.weight(1f).fillMaxWidth(), previousAvailable, nextAvailable)
-            DetailInspector(photo, state, callbacks, Modifier.fillMaxWidth().heightIn(max = 340.dp))
-        }
+        val haze = rememberHazeState()
+        DetailImageArea(
+            photo, state, callbacks, Modifier.fillMaxSize().hazeSource(haze), previousAvailable, nextAvailable,
+            compact = true,
+            preparedBitmap = bitmap,
+            controlsInHeader = maxWidth >= 600.dp && maxHeight < 480.dp,
+            openInspector = { panel = DetailPanel.INSPECTOR },
+            openFilmstrip = { panel = DetailPanel.FILMSTRIP },
+            onPanelDrag = { distance, active -> panelDrag = if (active) distance else null },
+        )
+        CompactDetailPanel(
+            panel, photo, state, callbacks, haze, (maxHeight * .86f).coerceAtMost(620.dp),
+            close = { panel = null },
+            onHidden = { focusRequester.requestFocus() },
+            dragDistance = panelDrag,
+        )
     }
 }
 }
 
+// Same-scene panel, like the compact filters. Avoid a platform popup: on Wasm its dismissal
+// can leave the underlying accessibility tree hidden even though the photograph is rendered.
 @Composable
-private fun DetailImageArea(photo: Photo, state: AppState, callbacks: AppCallbacks, modifier: Modifier, previousAvailable: Boolean = true, nextAvailable: Boolean = true) {
+private fun CompactDetailPanel(
+    panel: DetailPanel?, photo: Photo, state: AppState, callbacks: AppCallbacks,
+    haze: HazeState, maximumHeight: androidx.compose.ui.unit.Dp,
+    close: () -> Unit, onHidden: () -> Unit, dragDistance: Float? = null,
+) {
+    var retainedPanel by remember(photo.id) { mutableStateOf(DetailPanel.INSPECTOR) }
+    val draggedPanel = dragDistance?.let { if (it < 0f) DetailPanel.INSPECTOR else DetailPanel.FILMSTRIP }
+    val presentedPanel = panel ?: draggedPanel ?: retainedPanel
+    SideEffect { if (panel != null || draggedPanel != null) retainedPanel = presentedPanel }
+    val inspector = presentedPanel == DetailPanel.INSPECTOR
+    val title = if (inspector) "Curadoria e metadados" else "Miniaturas"
+    PhotoDetailPanel(panel != null, !inspector, title, haze, maximumHeight, close, onHidden, dragDistance) {
+        val closeFocus = remember { FocusRequester() }
+        LaunchedEffect(panel) { if (panel != null) closeFocus.requestFocus() }
+        Row(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp).heightIn(min = 58.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(title, Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
+            AppIconButton(Close, if (inspector) "Fechar curadoria e metadados" else "Fechar miniaturas", close, Modifier.focusRequester(closeFocus))
+        }
+        if (inspector) DetailInspector(photo, state, callbacks, Modifier.fillMaxWidth().weight(1f), Color.Transparent)
+        else Filmstrip(state, callbacks, Color.Transparent)
+    }
+}
+
+@Composable
+private fun DetailImageArea(
+    photo: Photo, state: AppState, callbacks: AppCallbacks, modifier: Modifier,
+    previousAvailable: Boolean = true, nextAvailable: Boolean = true,
+    compact: Boolean = false, controlsInHeader: Boolean = false,
+    openInspector: () -> Unit = {}, openFilmstrip: () -> Unit = {},
+    onPanelDrag: (Float, Boolean) -> Unit = { _, _ -> },
+    preparedBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+) {
     var problemOpen by remember(photo.id) { mutableStateOf(false) }
     var zoom by remember(photo.id) { mutableFloatStateOf(MIN_DETAIL_ZOOM) }
     var pan by remember(photo.id) { mutableStateOf(Offset.Zero) }
     var viewportSize by remember(photo.id) { mutableStateOf(IntSize.Zero) }
     var imageSize by remember(photo.id) { mutableStateOf(IntSize.Zero) }
+    var swipeOffset by remember(photo.id) { mutableFloatStateOf(0f) }
+    var swiping by remember(photo.id) { mutableStateOf(false) }
+    val currentCallbacks by rememberUpdatedState(callbacks)
+    val canGoBack by rememberUpdatedState(previousAvailable)
+    val canGoForward by rememberUpdatedState(nextAvailable)
+    val currentOpenInspector by rememberUpdatedState(openInspector)
+    val currentOpenFilmstrip by rememberUpdatedState(openFilmstrip)
+    val currentPanelDrag by rememberUpdatedState(onPanelDrag)
+    val swipeTranslation by animateFloatAsState(
+        swipeOffset, if (swiping) snap() else spring(dampingRatio = 1f, stiffness = Spring.StiffnessMedium),
+    )
+
+    val nativeSize = photo.metadata.width?.let { width -> photo.metadata.height?.let { height -> IntSize(width, height) } }
+    // 1:1 must follow the native image, not the display-sized bitmap.
+    val pixelZoom = detailPixelZoom(viewportSize, nativeSize ?: imageSize)
+    val zoomStops = detailZoomStops(pixelZoom)
+    val maximumZoom = detailMaxZoom(pixelZoom)
+    // Regions start as soon as the display bitmap is upscaled, and stay native at 1:1.
+    // Regions start at 400%: early enough to avoid visible upscaling, before native 1:1.
+    val sharpZoom = minOf(pixelZoom, 4f)
+    var regions by remember(photo.id) { mutableStateOf<List<RegionView>>(emptyList()) }
+    if (zoom + .01f < sharpZoom) LaunchedEffect(photo.id, zoom, sharpZoom) { regions = emptyList() }
+    // One pump per photo: panning never cancels the request in flight. The demand is recomputed
+    // after every response, so a continuous drag keeps receiving native crops instead of falling
+    // back to the 2048 px display bitmap outside the last crop.
+    val regionsActive = preparedBitmap != null && nativeSize != null && zoom + .01f >= pixelZoom
+    LaunchedEffect(photo.id, regionsActive, viewportSize, nativeSize, preparedBitmap) {
+        if (!regionsActive) return@LaunchedEffect
+        var requested: NativeRegion? = null
+        var requestedFrom = pan
+        var requestedZoom = zoom
+        var issued = false
+        while (true) {
+            val native = nativeSize
+            val restingPan = pan
+            val restingZoom = zoom
+            val visible = visibleNativeRegion(viewportSize, native, restingZoom, restingPan, margin = 1f) ?: break
+            // Leading edge: ask as soon as the window is not fully covered, not after the gesture stops.
+            val target = if (regionCoverage(regions.map(RegionView::region), visible) >= 1f) null else visibleNativeRegion(
+                viewportSize, native, restingZoom, restingPan, DETAIL_REGION_MARGIN,
+                lead = if (requestedZoom == restingZoom) detailRegionLead(Offset(restingPan.x - requestedFrom.x, restingPan.y - requestedFrom.y), viewportSize) else Offset.Zero,
+            )
+            if (target == null || target == requested) {
+                // Nothing new to ask for until the view moves; conflation happens here.
+                snapshotFlow { pan to zoom }.first { it.first != restingPan || it.second != restingZoom }
+                continue
+            }
+            requested = target
+            requestedFrom = restingPan
+            requestedZoom = restingZoom
+            if (issued) kotlinx.coroutines.delay(DETAIL_REGION_MIN_SPACING_MS)
+            issued = true
+            val bitmap = try {
+                callbacks.imageLoader.loadRegion(photo, target.x, target.y, target.width, target.height)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+            // Applied as soon as it lands, mid-drag included, and kept for the rest of the inspection.
+            val added = RegionView(bitmap, target.x, target.y, target.width, target.height)
+            regions = retainRegions(listOf(added) + regions.filterNot {
+                it.x == added.x && it.y == added.y && it.width == added.width && it.height == added.height
+            })
+        }
+    }
+    val effectiveBitmap = preparedBitmap
 
     fun updateZoom(target: Float, focalPoint: Offset = Offset(viewportSize.width / 2f, viewportSize.height / 2f)) {
-        val next = target.coerceIn(MIN_DETAIL_ZOOM, MAX_DETAIL_ZOOM)
+        val next = target.coerceIn(MIN_DETAIL_ZOOM, maximumZoom)
         if (next == MIN_DETAIL_ZOOM) {
             zoom = next
             pan = Offset.Zero
@@ -1879,7 +2269,22 @@ private fun DetailImageArea(photo: Photo, state: AppState, callbacks: AppCallbac
     Column(
         modifier.background(Stage).focusable().onFocusChanged { callbacks.shortcutScopeFocused(it.hasFocus) }.semantics { contentDescription = "Visualizador da fotografia" },
     ) {
-        Box(Modifier.fillMaxWidth().height(58.dp).background(Panel)) {
+        if (compact) {
+            Row(Modifier.fillMaxWidth().height(48.dp).background(Panel).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                AppIconButton(ArrowBack, "Voltar à biblioteca", { callbacks.dispatch(Action.CloseDetail) })
+                Text(photo.displayName, Modifier.weight(1f).padding(horizontal = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                AppIconButton(PhotoLibrary, "Abrir miniaturas", openFilmstrip, enabled = state.visiblePhotos.size > 1)
+                AppIconButton(Tune, "Abrir curadoria e metadados", openInspector)
+                if (controlsInHeader) {
+                    AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, enabled = previousAvailable)
+                    DetailZoomControls(
+                        zoom, { updateZoom(nextDetailZoom(zoom, -1, zoomStops, maximumZoom)) }, { updateZoom(nextDetailZoom(zoom, 1, zoomStops, maximumZoom)) },
+                        { updateZoom(MIN_DETAIL_ZOOM) }, compact = true, maximumZoom = maximumZoom, pixelZoom = pixelZoom,
+                    )
+                    AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, enabled = nextAvailable)
+                }
+            }
+        } else Box(Modifier.fillMaxWidth().height(58.dp).background(Panel)) {
             AppIconButton(ArrowBack, "Voltar à biblioteca", { callbacks.dispatch(Action.CloseDetail) }, Modifier.align(Alignment.CenterStart).padding(start = 7.dp))
             Column(Modifier.align(Alignment.Center).widthIn(max = 560.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(photo.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, color = TextPrimary, fontWeight = FontWeight.SemiBold)
@@ -1890,14 +2295,31 @@ private fun DetailImageArea(photo: Photo, state: AppState, callbacks: AppCallbac
             PhotoImage(
                 photo = photo,
                 callbacks = callbacks,
-                maximumDimension = 4096,
+                maximumDimension = br.com.lincon.phototool.api.DISPLAY_PREVIEW_DIMENSION,
                 scale = ContentScale.Fit,
                 modifier = Modifier.fillMaxSize().clipToBounds().onSizeChanged { viewportSize = it }
-                    .pointerInput(photo.id, viewportSize, imageSize) {
-                        detectTransformGestures { centroid, panChange, zoomChange, _ ->
-                            updateZoom(zoom * zoomChange, centroid)
-                            pan = constrainDetailPan(pan + panChange, zoom, viewportSize, imageSize)
-                        }
+                    .pointerInput(photo.id, viewportSize, imageSize, compact) {
+                        detectDetailPhotoGestures(
+                            isFit = { zoom == MIN_DETAIL_ZOOM },
+                            navigationThreshold = maxOf(56.dp.toPx(), size.width * .12f),
+                            panelThreshold = maxOf(56.dp.toPx(), size.height * .12f),
+                            onVerticalSwipe = if (compact) { direction ->
+                                if (direction < 0) currentOpenInspector() else currentOpenFilmstrip()
+                            } else null,
+                            onPanelDrag = { distance, active -> currentPanelDrag(distance, active) },
+                            onDrag = { distance, active ->
+                                swiping = active
+                                val available = if (distance < 0) canGoForward else canGoBack
+                                swipeOffset = if (available) distance else distance / (3f + kotlin.math.abs(distance) / 80.dp.toPx())
+                            },
+                            onNavigate = { direction ->
+                                if (if (direction > 0) canGoForward else canGoBack) currentCallbacks.navigate(direction)
+                            },
+                            onTransform = { centroid, panChange, zoomChange ->
+                                updateZoom(zoom * zoomChange, centroid)
+                                pan = constrainDetailPan(pan + panChange, zoom, viewportSize, imageSize)
+                            },
+                        )
                     }
                     .pointerInput(photo.id, viewportSize, imageSize) {
                         awaitPointerEventScope {
@@ -1914,26 +2336,34 @@ private fun DetailImageArea(photo: Photo, state: AppState, callbacks: AppCallbac
                     }
                     .semantics {
                         contentDescription = "Área ampliável de ${photo.displayName}"
-                        stateDescription = "Zoom atual: ${(zoom * 100).roundToInt()}%"
+                        stateDescription = "Zoom atual: ${(zoom * 100).roundToInt()}%" +
+                            if (zoom >= pixelZoom - .01f) " · pixels 1:1" else ""
                     },
                 issueClicked = { problemOpen = true },
                 imageModifier = Modifier.graphicsLayer {
                     scaleX = zoom
                     scaleY = zoom
-                    translationX = pan.x
+                    translationX = pan.x + swipeTranslation
                     translationY = pan.y
                 },
                 previewDimensionsChanged = { imageSize = it },
+                preparedBitmap = effectiveBitmap,
+                nativeSize = nativeSize,
+                regions = regions,
+                filterQuality = detailFilterQuality(zoom, pixelZoom),
             )
-            AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, Modifier.align(Alignment.CenterStart).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = previousAvailable)
-            AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, Modifier.align(Alignment.CenterEnd).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = nextAvailable)
-            DetailZoomControls(
-                zoom = zoom,
-                zoomOut = { updateZoom(nextDetailZoom(zoom, -1)) },
-                zoomIn = { updateZoom(nextDetailZoom(zoom, 1)) },
-                fit = { updateZoom(MIN_DETAIL_ZOOM) },
-                modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp),
-            )
+            if (!compact) {
+                AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, Modifier.align(Alignment.CenterStart).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = previousAvailable)
+                AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, Modifier.align(Alignment.CenterEnd).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = nextAvailable)
+                DetailZoomControls(
+                    zoom = zoom,
+                    zoomOut = { updateZoom(nextDetailZoom(zoom, -1, zoomStops, maximumZoom)) },
+                    zoomIn = { updateZoom(nextDetailZoom(zoom, 1, zoomStops, maximumZoom)) },
+                    fit = { updateZoom(MIN_DETAIL_ZOOM) },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(10.dp),
+                    maximumZoom = maximumZoom, pixelZoom = pixelZoom,
+                )
+            }
             if (problemOpen) PhotoProblemPanel(
                 photo,
                 Modifier.align(Alignment.TopCenter).padding(12.dp).widthIn(max = 460.dp),
@@ -1941,33 +2371,50 @@ private fun DetailImageArea(photo: Photo, state: AppState, callbacks: AppCallbac
                 recover = { callbacks.dispatch(Action.OpenSettings) },
             )
         }
-        if (state.visiblePhotos.size > 1) Filmstrip(state, callbacks)
+        if (compact && !controlsInHeader) {
+            Row(
+                Modifier.fillMaxWidth().height(48.dp).background(Panel).padding(horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, enabled = previousAvailable)
+                DetailZoomControls(
+                    zoom, { updateZoom(nextDetailZoom(zoom, -1, zoomStops, maximumZoom)) }, { updateZoom(nextDetailZoom(zoom, 1, zoomStops, maximumZoom)) },
+                    { updateZoom(MIN_DETAIL_ZOOM) }, compact = true, maximumZoom = maximumZoom, pixelZoom = pixelZoom,
+                )
+                AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, enabled = nextAvailable)
+            }
+        } else if (!compact && state.visiblePhotos.size > 1) Filmstrip(state, callbacks)
     }
 }
 
 @Composable
-private fun DetailZoomControls(zoom: Float, zoomOut: () -> Unit, zoomIn: () -> Unit, fit: () -> Unit, modifier: Modifier = Modifier) {
+private fun DetailZoomControls(
+    zoom: Float, zoomOut: () -> Unit, zoomIn: () -> Unit, fit: () -> Unit,
+    modifier: Modifier = Modifier, compact: Boolean = false,
+    maximumZoom: Float = BASE_MAX_DETAIL_ZOOM, pixelZoom: Float = BASE_MAX_DETAIL_ZOOM,
+) {
     val percentage = (zoom * 100).roundToInt()
+    val label = if (kotlin.math.abs(zoom - pixelZoom) <= pixelZoom * .01f) "1:1" else "$percentage%"
     Surface(
         modifier = modifier.semantics { contentDescription = "Controles de zoom"; stateDescription = "Zoom atual: $percentage%" },
         color = Panel.copy(alpha = .90f),
         shape = CompactShape,
-        border = BorderStroke(1.dp, Hairline),
-        shadowElevation = 5.dp,
+        border = if (compact) null else BorderStroke(1.dp, Hairline),
+        shadowElevation = if (compact) 0.dp else 5.dp,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AppIconButton(ZoomOut, "Diminuir zoom", zoomOut, enabled = zoom > MIN_DETAIL_ZOOM + .01f)
             Box(Modifier.width(62.dp).height(44.dp).semantics { contentDescription = "Zoom atual: $percentage%" }, contentAlignment = Alignment.Center) {
-                Text("$percentage%", color = TextPrimary, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
+                Text(label, color = TextPrimary, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
             }
-            AppIconButton(ZoomIn, "Aumentar zoom", zoomIn, enabled = zoom < MAX_DETAIL_ZOOM - .01f)
+            AppIconButton(ZoomIn, "Aumentar zoom", zoomIn, enabled = zoom < maximumZoom - .01f)
             AppIconButton(FitScreen, "Ajustar fotografia à janela", fit, enabled = zoom > MIN_DETAIL_ZOOM + .01f)
         }
     }
 }
 
 @Composable
-private fun Filmstrip(state: AppState, callbacks: AppCallbacks) {
+private fun Filmstrip(state: AppState, callbacks: AppCallbacks, background: Color = Panel) {
     val visible = state.visiblePhotos
     val current = visible.indexOfFirst { it.id == state.selectedId }.coerceAtLeast(0)
     val start = maxOf(0, current - 8)
@@ -1975,7 +2422,7 @@ private fun Filmstrip(state: AppState, callbacks: AppCallbacks) {
     val selectedWithin = (current - start).coerceIn(0, neighbors.lastIndex)
     val filmstripState = rememberLazyListState()
     LaunchedEffect(state.selectedId, selectedWithin) { filmstripState.scrollToItem(selectedWithin) }
-    LazyRow(state = filmstripState, modifier = Modifier.fillMaxWidth().height(74.dp).background(Panel).padding(horizontal = 7.dp, vertical = 5.dp).semantics { contentDescription = "Faixa de fotografias próximas" }, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+    LazyRow(state = filmstripState, modifier = Modifier.fillMaxWidth().height(74.dp).background(background).padding(horizontal = 7.dp, vertical = 5.dp).semantics { contentDescription = "Faixa de fotografias próximas" }, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
         lazyItems(neighbors, key = { it.id }) { item ->
             val selected = item.id == state.selectedId
             PhotoImage(item, callbacks, 240, ContentScale.Fit, Modifier.width(96.dp).fillMaxHeight().then(if (selected) Modifier.border(2.dp, Amber) else Modifier).combinedClickable(onClick = { callbacks.dispatch(Action.Select(item.id)) }, onDoubleClick = {}).focusable().semantics { contentDescription = "Filmstrip ${item.displayName}"; this.selected = selected })
@@ -1987,28 +2434,28 @@ private enum class InspectorTab { INFO, EDIT, RECIPES }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbacks, modifier: Modifier) {
+private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbacks, modifier: Modifier, background: Color = Inspector) {
     val scope = rememberCoroutineScope()
     var auxiliary by remember(photo.id) { mutableStateOf(AuxiliaryView(status = "Carregando receitas e HDR")) }
     var busy by remember(photo.id) { mutableStateOf(false) }
     var recipesOpen by remember(photo.id) { mutableStateOf(false) }
     var keyword by remember(photo.id) { mutableStateOf("") }
     var keywordError by remember(photo.id) { mutableStateOf<String?>(null) }
-    LaunchedEffect(photo.id) { auxiliary = runCatching { callbacks.auxiliary.load(photo) }.getOrElse { AuxiliaryView(error = it.message ?: "Falha ao ler dados auxiliares") } }
+    LaunchedEffect(photo.id) { if (callbacks.capabilities.auxiliary) auxiliary = runCatching { callbacks.auxiliary.load(photo) }.getOrElse { AuxiliaryView(error = it.message ?: "Falha ao ler dados auxiliares") } }
     fun runAux(operation: suspend () -> AuxiliaryView) {
         if (busy) return
         busy = true
         scope.launch { auxiliary = runCatching { operation() }.getOrElse { AuxiliaryView(error = it.message ?: "Falha na operação") }; busy = false }
     }
     Column(
-        modifier.background(Inspector).verticalScroll(rememberScrollState()).padding(18.dp)
+        modifier.background(background).verticalScroll(rememberScrollState()).padding(18.dp)
             .semantics { contentDescription = "Painel de curadoria da fotografia" },
         verticalArrangement = Arrangement.spacedBy(11.dp),
     ) {
         Text("CURADORIA", color = Amber, fontWeight = FontWeight.Bold, style = ProofAnnotationStyle)
         QuickControls(photo, state, callbacks)
-        EditorialRatingSlider(photo.editorial.rating, state.writeEnabled && photo.writable, "Avaliação editorial") { callbacks.mutate(photo, photo.editorial.copy(rating = it)) }
-        EditorialLabelSelector(photo.editorial.label, state.writeEnabled && photo.writable) { callbacks.mutate(photo, photo.editorial.copy(label = it)) }
+        EditorialRatingSlider(photo.editorial.rating, canEditPhoto(state, photo), "Avaliação editorial") { callbacks.mutate(photo, photo.editorial.copy(rating = it)) }
+        EditorialLabelSelector(photo.editorial.label, canEditPhoto(state, photo)) { callbacks.mutate(photo, photo.editorial.copy(label = it)) }
         val status = when (photo.writeState) { WriteState.IDLE -> editorialSummary(photo.editorial); WriteState.SAVING -> "Salvando no XMP adjacente"; WriteState.PERSISTED -> "Alterações salvas e verificadas"; WriteState.FAILED -> photo.writeError ?: "Falha ao salvar no XMP" }
         Row(Modifier.fillMaxWidth().clip(CompactShape).background(Stage).padding(9.dp), verticalAlignment = Alignment.CenterVertically) {
             Icon(if (photo.writeState == WriteState.FAILED) Close else Check, null, tint = if (photo.writeState == WriteState.FAILED) Danger else PickGreen, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(6.dp)); Text(status, color = Muted, style = MaterialTheme.typography.labelSmall)
@@ -2024,14 +2471,15 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
                     Icon(ErrorOutline, null, tint = Danger, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(7.dp))
                     Text(photoProblemText(photo), color = TextPrimary, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                 }
-                Text("Revise o sidecar em uma cópia segura e sincronize novamente.", color = Muted, style = MaterialTheme.typography.labelSmall)
+                Text(if (state.remote != null) "Recarregue o estado do servidor antes de repetir a alteração." else "Revise o sidecar em uma cópia segura e sincronize novamente.", color = Muted, style = MaterialTheme.typography.labelSmall)
                 OutlinedButton(
-                    onClick = { callbacks.dispatch(Action.OpenSettings) },
+                    onClick = { if (state.remote != null) callbacks.refresh() else callbacks.dispatch(Action.OpenSettings) },
+                    enabled = state.remote?.let { !it.loading && it.savingPhotoId == null } ?: true,
                     shape = CompactShape,
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = Amber),
                     border = BorderStroke(1.dp, Amber.copy(alpha = .72f)),
                     modifier = Modifier.heightIn(min = 44.dp),
-                ) { Text("Ir às configurações") }
+                ) { Text(if (state.remote != null) "Recarregar estado do servidor" else "Ir às configurações") }
             }
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -2042,9 +2490,9 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
         HorizontalDivider(color = Hairline)
         Text("PALAVRAS-CHAVE", color = Amber, fontWeight = FontWeight.Bold, style = ProofAnnotationStyle)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            photo.editorial.keywords.forEach { word -> InputChip(selected = true, shape = CompactShape, onClick = { callbacks.mutate(photo, photo.editorial.copy(keywords = photo.editorial.keywords - word)) }, enabled = state.writeEnabled && photo.writable, label = { Text(word) }, trailingIcon = { Icon(Close, null, Modifier.size(14.dp)) }) }
+            photo.editorial.keywords.forEach { word -> InputChip(selected = true, shape = CompactShape, onClick = { callbacks.mutate(photo, photo.editorial.copy(keywords = photo.editorial.keywords - word)) }, enabled = canEditPhoto(state, photo), label = { Text(word) }, trailingIcon = { Icon(Close, null, Modifier.size(14.dp)) }) }
         }
-        val canAddKeyword = keyword.isNotBlank() && state.writeEnabled && photo.writable
+        val canAddKeyword = keyword.isNotBlank() && canEditPhoto(state, photo)
         fun addKeyword() {
             if (!canAddKeyword) return
             runCatching { normalizeFlatKeyword(keyword) }
@@ -2057,6 +2505,7 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
                 onValueChange = { keyword = it },
                 label = "PALAVRA-CHAVE",
                 placeholder = "Palavra-chave",
+                enabled = canEditPhoto(state, photo),
                 leadingIcon = Tag,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions = KeyboardActions(onDone = { addKeyword() }),
@@ -2071,6 +2520,10 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
         }
         keywordError?.let { Text(it, color = Danger, style = MaterialTheme.typography.labelSmall, modifier = Modifier.semantics { contentDescription = "Erro de palavra-chave" }) }
         HorizontalDivider(color = Hairline)
+        if (!callbacks.capabilities.auxiliary) {
+            Text("Receitas Fuji, HDR e nomes dos arquivos pareados não são expostos pela API atual.", color = Muted, style = MaterialTheme.typography.bodySmall)
+            return@Column
+        }
         val rafPhoto = photo.rawPath?.substringAfterLast('.', "")?.equals("raf", true) == true
         val recipeLabel = if (rafPhoto) "receitas e HDR" else "receitas Fuji"
         TextButton(onClick = { recipesOpen = !recipesOpen }, shape = CompactShape, modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).semantics { contentDescription = if (recipesOpen) "Ocultar $recipeLabel" else "Mostrar $recipeLabel" }) {
@@ -2137,7 +2590,7 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
             SettingsCard("BIBLIOTECA") {
                 SettingsValue("Pasta", state.library ?: "Não selecionada")
                 SettingsValue("Cache", state.cache ?: "Não configurado")
-                OutlinedButton(onClick = callbacks.chooseLibrary, shape = CompactShape, enabled = !state.sync.running, border = BorderStroke(1.dp, Hairline), modifier = Modifier.heightIn(min = 44.dp)) { Icon(Folder, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("Escolher pasta da biblioteca") }
+                OutlinedButton(onClick = callbacks.chooseLibrary, shape = CompactShape, enabled = callbacks.capabilities.localLibrary && !state.sync.running, border = BorderStroke(1.dp, Hairline), modifier = Modifier.heightIn(min = 44.dp)) { Icon(Folder, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("Escolher pasta da biblioteca") }
             }
             SettingsCard("EDIÇÃO") {
                 val readOnlyMode = !state.writeEnabled
@@ -2150,12 +2603,13 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
                     Switch(
                         checked = readOnlyMode,
                         onCheckedChange = callbacks.setReadOnlyMode,
-                        enabled = !pendingWrite,
+                        enabled = callbacks.capabilities.localLibrary && !pendingWrite,
                         modifier = Modifier.heightIn(min = 44.dp).semantics { contentDescription = "Modo somente leitura" },
                     )
                 }
                 Text(
                     when {
+                        !callbacks.capabilities.localLibrary -> "Este candidato web é somente leitura, mesmo se o servidor permitir escrita. Nenhuma edição ou sincronização é enviada."
                         pendingWrite -> "Aguarde a conclusão da edição em andamento antes de alterar o modo."
                         readOnlyMode -> "Novas alterações em XMP e FP2 estão bloqueadas. Esta preferência vale para as próximas aberturas."
                         else -> "A escrita está liberada apenas para XMP adjacente e FP2 editável. RAW e JPEG permanecem imutáveis. Esta preferência vale para as próximas aberturas."
@@ -2183,8 +2637,11 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
                     val total = state.sync.totalPhotos
                     if (total != null && total > 0) LinearProgressIndicator(progress = { (state.sync.photos.toFloat() / total).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
                     else LinearProgressIndicator(Modifier.fillMaxWidth())
-                    OutlinedButton(onClick = callbacks.cancelSync, shape = CompactShape, modifier = Modifier.heightIn(min = 44.dp)) { Icon(Close, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("Cancelar") }
-                } else Button(onClick = callbacks.synchronize, shape = CompactShape, enabled = state.library != null, modifier = Modifier.heightIn(min = 44.dp)) { Icon(RefreshVectorIcon, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text(if (state.sync.phase == SyncPhase.FAILED) "Tentar novamente" else "Sincronizar") }
+                    OutlinedButton(onClick = callbacks.cancelSync, enabled = callbacks.capabilities.synchronize, shape = CompactShape, modifier = Modifier.heightIn(min = 44.dp)) { Icon(Close, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text("Cancelar") }
+                } else Button(onClick = callbacks.synchronize, shape = CompactShape, enabled = callbacks.capabilities.synchronize && state.library != null, modifier = Modifier.heightIn(min = 44.dp)) { Icon(RefreshVectorIcon, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text(if (state.sync.phase == SyncPhase.FAILED) "Tentar novamente" else "Sincronizar") }
+            }
+            if (state.remote != null) SettingsCard("CAPACIDADES WEB") {
+                Text("Galeria paginada, busca, filtros, escolhidas, recentes, detalhe e previews usam a API. Calendário e navegação hierárquica por pastas ainda não estão integrados; a API oferece apenas facets de pastas limitados. Fuji, HDR, transferências e nomes dos pares RAW/JPEG não são expostos. Atalhos editoriais e escrita permanecem bloqueados.", color = Muted)
             }
             SettingsCard("SEGURANÇA") {
                 Text("A sincronização é somente leitura. O PhotoTool nunca altera os bytes de arquivos RAW ou JPEG. O modo de escrita explícito altera apenas XMP adjacente e FP2 editável, após verificações de identidade, topologia, bytes e releitura.", color = Muted)
@@ -2246,7 +2703,9 @@ private fun StatePanel(icon: ImageVector, title: String, message: String, action
 private fun EmptyLibrary(callbacks: AppCallbacks) = StatePanel(PhotoLibrary, "Escolha uma biblioteca de fotos", "O PhotoTool indexa a pasta sem alterar os arquivos originais.", "Escolher pasta", callbacks.chooseLibrary)
 
 @Composable
-private fun EmptyGallery(state: AppState, callbacks: AppCallbacks, requestInitialFocus: Boolean = true) = if (state.photos.isEmpty()) {
+private fun EmptyGallery(state: AppState, callbacks: AppCallbacks, requestInitialFocus: Boolean = true) = if (state.remote != null && state.remote.libraryTotal == 0) {
+    StatePanel(PhotoLibrary, "Nenhuma fotografia indexada", "O servidor não tem um snapshot publicado. Sincronização indisponível neste candidato.", "Atualizar snapshot", callbacks.refresh, requestInitialFocus)
+} else if (state.remote == null && state.photos.isEmpty()) {
     StatePanel(PhotoLibrary, "Nenhuma fotografia indexada", "Sincronize a biblioteca para criar um novo snapshot.", "Sincronizar agora", callbacks.synchronize, requestInitialFocus)
 } else {
     StatePanel(ImageSearch, "Nenhum resultado", "Nenhuma fotografia corresponde à busca e aos filtros atuais.", "Limpar busca e filtros", { callbacks.dispatch(Action.SetQuery(Query(sort = state.query.sort))) }, requestInitialFocus)

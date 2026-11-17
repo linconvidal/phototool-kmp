@@ -8,7 +8,26 @@ import br.com.lincon.phototool.domain.Photo
 fun interface PlatformImageLoader {
     suspend fun load(photo: Photo, maximumDimension: Int): ImageBitmap?
 
+    /** Current-photo-only original; never enters the lightweight preview cache. */
+    suspend fun loadOriginal(photo: Photo): OriginalImage? = null
+
+    /** Cheap display-sized upgrade fetched in the background; hosts may keep it out of tests. */
+    suspend fun prefetchDisplay(photo: Photo): ImageBitmap? = null
+
+    /** Native pixels of a bounded region, used instead of decoding the whole original at 1:1. */
+    suspend fun loadRegion(photo: Photo, x: Int, y: Int, width: Int, height: Int): ImageBitmap? = null
+
     companion object { val None = PlatformImageLoader { _, _ -> null } }
+}
+
+class OriginalImage(val bitmap: ImageBitmap, private val dispose: () -> Unit = {}) {
+    private var closed = false
+
+    fun close() {
+        if (closed) return
+        closed = true
+        dispose()
+    }
 }
 
 data class FujiRecipeView(

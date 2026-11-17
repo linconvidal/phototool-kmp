@@ -41,6 +41,39 @@ data class ObservedMetadata(
     val cameraDisplay: String? get() = camera ?: listOfNotNull(cameraMake, cameraModel).joinToString(" ").ifBlank { null }
 }
 
+/** How the snapshot proved a photo's preview can be produced, decided once during sync. */
+enum class PreviewStrategy {
+    /** A JPEG next to the RAW carries the displayable image. */
+    PAIRED_JPEG,
+    /** The photograph itself is a JPEG. */
+    DIRECT_JPEG,
+    /** A TIFF container (CR2/DNG) publishes the embedded JPEG at a byte interval. */
+    TIFF_EMBEDDED,
+    /** A container (CR3/RAF) exposes the embedded preview only through its reader. */
+    CONTAINER_EMBEDDED,
+    /** A TIFF container publishes no interval and the base image is the only decodable preview. */
+    TIFF_FULL_DECODE,
+}
+
+/**
+ * Validated preview plan stored in the snapshot. It holds strategy, byte interval and dimensions,
+ * never image bytes, so loading a preview executes a decision instead of rediscovering the format.
+ */
+data class PreviewPlan(
+    val strategy: PreviewStrategy,
+    val offset: Long = 0,
+    val length: Long = 0,
+    val width: Int,
+    val height: Int,
+    /** TIFF orientation to apply after decoding; null when the source carries none. */
+    val orientation: String? = null,
+    /** Set when sync proved this photo has no usable preview. The photo stays in the snapshot. */
+    val unavailability: String? = null,
+) {
+    val available: Boolean get() = unavailability == null
+    val embeddedInterval: Boolean get() = strategy == PreviewStrategy.TIFF_EMBEDDED
+}
+
 data class MediaIdentity(
     val path: String,
     val fileKey: String,
@@ -49,6 +82,14 @@ data class MediaIdentity(
 ) {
     val isComplete: Boolean get() = path.isNotBlank() && fileKey.isNotBlank() && size >= 0 && modifiedMillis >= 0
 }
+
+/** Path-free presentation from a remote snapshot, never a filesystem identity or write authority. */
+data class PhotoPresentation(
+    val displayName: String,
+    val format: String,
+    val aspectRatio: Float,
+    val previewUrl: String,
+)
 
 private val FilenameNumberPattern = Regex("""\d+""")
 
@@ -66,18 +107,22 @@ data class Photo(
     val editorial: EditorialState = EditorialState(),
     val writable: Boolean = true,
     val issue: String? = null,
+    val previewPlan: PreviewPlan? = null,
     val writeState: WriteState = WriteState.IDLE,
     val writeError: String? = null,
+    val presentation: PhotoPresentation? = null,
+    /** Opaque server XMP revision; never a filesystem identity. */
+    val editorialRevision: String? = null,
 ) {
-    val displayName: String get() = (rawPath ?: jpegPath ?: stem).substringAfterLast('/')
+    val displayName: String get() = presentation?.displayName ?: (rawPath ?: jpegPath ?: stem).substringAfterLast('/')
     val filenameNumber: String? get() = FilenameNumberPattern.findAll(stem).lastOrNull()?.value
     val rawFormat: String? get() = rawPath?.substringAfterLast('.', "")?.uppercase()?.ifBlank { "RAW" }
-    val mediaFormatLabel: String get() = when {
+    val mediaFormatLabel: String get() = presentation?.format ?: when {
         rawPath != null && jpegPath != null -> "${rawFormat ?: "RAW"} + JPEG"
         rawPath != null -> rawFormat ?: "RAW"
         else -> "JPEG"
     }
-    val aspectRatio: Float get() = if ((metadata.width ?: 0) > 0 && (metadata.height ?: 0) > 0)
+    val aspectRatio: Float get() = presentation?.aspectRatio ?: if ((metadata.width ?: 0) > 0 && (metadata.height ?: 0) > 0)
         metadata.width!!.toFloat() / metadata.height!! else 1.5f
 }
 

@@ -6,57 +6,79 @@ import br.com.lincon.phototool.state.SyncStatus
 import com.ashampoo.kim.Kim
 import com.ashampoo.kim.common.convertToPhotoMetadata
 import com.ashampoo.kim.format.ImageMetadata
+import com.ashampoo.kim.format.tiff.TiffReader
 import com.ashampoo.kim.format.tiff.constant.ExifTag
+import com.ashampoo.kim.model.ImageFormat
 import com.ashampoo.xmp.XMPMetaFactory
+import java.nio.channels.FileChannel
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
-private const val MAX_METADATA_SOURCE_BYTES = 1024L * 1024 * 1024
+private const val MAX_METADATA_SOURCE_BYTES = MAX_MEDIA_SOURCE_BYTES
+private const val MAX_DISCOVERED_DIRECTORIES = 200_000
+private const val MAX_DISCOVERED_FILES = 400_000
+private const val MAX_MEDIA_CANDIDATES = 200_000
+private const val MAX_SIDECAR_ENTRIES = 100_000
+private const val MAX_SCANNED_PHOTOS = 100_000
 
-data class ScanResult(val photos: List<Photo>, val errors: Int)
+data class ScanResult(val photos: List<Photo>, val errors: Int, val unavailablePreviews: Int = 0)
 
 interface MediaObservationAdapter { fun observe(bytes: ByteArray, kind: MediaKind): ObservedMetadata }
 
-/** Reads JPEG and supported RAW metadata through Kim's bounded streaming JVM API. */
+/** Reads JPEG and supported RAW metadata without materializing complete media files. */
 class KimMediaObservationAdapter : MediaObservationAdapter {
     override fun observe(bytes: ByteArray, kind: MediaKind): ObservedMetadata {
-        if (bytes.isEmpty() || bytes.size > MAX_METADATA_SOURCE_BYTES) return ObservedMetadata(
-            status = MetadataStatus.ERROR,
-            errorCode = "metadata-source-size",
-        )
-        return try {
-            val image = Kim.readMetadata(bytes)
-                ?: return ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-unsupported")
-            val value = image.convertToPhotoMetadata()
-            val width = value.orientedSize?.width ?: value.widthPx
-            val height = value.orientedSize?.height ?: value.heightPx
-            val observed = ObservedMetadata(
-                capturedAt = canonicalMetadataCapturedAt(image),
-                camera = value.cameraName,
-                cameraMake = value.cameraMake?.safeText(),
-                cameraModel = value.cameraModel?.safeText(),
-                lens = value.lensName?.safeText(),
-                focalLength = value.focalLength.valid(0.01, 10_000.0),
-                aperture = value.fNumber.valid(0.1, 128.0),
-                exposureSeconds = value.exposureTime.valid(0.000001, 86_400.0),
-                iso = value.iso?.takeIf { it in 1..10_000_000 },
-                latitude = value.gpsCoordinates?.latitude?.takeIf { it in -90.0..90.0 },
-                longitude = value.gpsCoordinates?.longitude?.takeIf { it in -180.0..180.0 },
-                width = width?.takeIf { it in 1..1_000_000 },
-                height = height?.takeIf { it in 1..1_000_000 },
-                status = MetadataStatus.AVAILABLE,
-            )
-            val hasAny = listOf(observed.capturedAt, observed.cameraMake, observed.cameraModel, observed.lens,
-                observed.focalLength, observed.aperture, observed.exposureSeconds, observed.iso,
-                observed.latitude, observed.width).any { it != null }
-            if (hasAny) observed else observed.copy(status = MetadataStatus.MISSING)
-        } catch (error: Exception) {
-            ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-read-failed:${error.javaClass.simpleName}".take(160))
+        if (bytes.isEmpty() || bytes.size > MAX_METADATA_SOURCE_BYTES) return sourceSizeError()
+        return observedOrError { Kim.readMetadata(bytes) }
+    }
+
+    internal fun observe(
+        channel: FileChannel,
+        contentLength: Long,
+        format: ImageFormat,
+    ): ObservedMetadata {
+        if (contentLength !in 1..MAX_METADATA_SOURCE_BYTES) return sourceSizeError()
+        return observedOrError {
+            val reader = BoundedFileChannelByteReader(channel, contentLength, MAX_METADATA_WORK_BYTES)
+            when (format) {
+                ImageFormat.CR2, ImageFormat.DNG -> readTiffMetadata(reader, format)
+                else -> Kim.readMetadata(reader)
+            }
         }
     }
 
+    private fun observedOrError(read: () -> ImageMetadata?): ObservedMetadata = try {
+        val image = read() ?: return ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-unsupported")
+        val value = image.convertToPhotoMetadata()
+        val width = value.orientedSize?.width ?: value.widthPx
+        val height = value.orientedSize?.height ?: value.heightPx
+        val observed = ObservedMetadata(
+            capturedAt = canonicalMetadataCapturedAt(image),
+            camera = value.cameraName,
+            cameraMake = value.cameraMake?.safeText(),
+            cameraModel = value.cameraModel?.safeText(),
+            lens = value.lensName?.safeText(),
+            focalLength = value.focalLength.valid(0.01, 10_000.0),
+            aperture = value.fNumber.valid(0.1, 128.0),
+            exposureSeconds = value.exposureTime.valid(0.000001, 86_400.0),
+            iso = value.iso?.takeIf { it in 1..10_000_000 },
+            latitude = value.gpsCoordinates?.latitude?.takeIf { it in -90.0..90.0 },
+            longitude = value.gpsCoordinates?.longitude?.takeIf { it in -180.0..180.0 },
+            width = width?.takeIf { it in 1..1_000_000 },
+            height = height?.takeIf { it in 1..1_000_000 },
+            status = MetadataStatus.AVAILABLE,
+        )
+        val hasAny = listOf(observed.capturedAt, observed.cameraMake, observed.cameraModel, observed.lens,
+            observed.focalLength, observed.aperture, observed.exposureSeconds, observed.iso,
+            observed.latitude, observed.width).any { it != null }
+        if (hasAny) observed else observed.copy(status = MetadataStatus.MISSING)
+    } catch (error: Exception) {
+        ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-read-failed:${error.javaClass.simpleName}".take(160))
+    }
+
+    private fun sourceSizeError() = ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-source-size")
     private fun String.safeText(): String? = trim().replace("\u0000", "").takeIf { it.isNotEmpty() && it.length <= 256 }
     private fun Double?.valid(minimum: Double, maximum: Double): Double? = this?.takeIf { it.isFinite() && it in minimum..maximum }
 }
@@ -102,11 +124,13 @@ class LibraryScanner(
         val canonicalSidecars = mutableMapOf<Pair<String, String>, MutableList<String>>()
         var directories = 0
         var files = 0
+        var sidecarEntries = 0
         Files.walkFileTree(realRoot, setOf(), Int.MAX_VALUE, object : SimpleFileVisitor<Path>() {
             override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
                 if (cancelled.get()) return FileVisitResult.TERMINATE
                 if (dir != realRoot && (dir.fileName.toString().startsWith(".") || Files.isSymbolicLink(dir))) return FileVisitResult.SKIP_SUBTREE
                 directories++
+                require(directories <= MAX_DISCOVERED_DIRECTORIES) { "Library has too many directories" }
                 progress(SyncStatus(SyncPhase.DISCOVERING, directories, files, 0, 0, realRoot.relativize(dir).toString().take(160), true, "Descobrindo mídia"))
                 return FileVisitResult.CONTINUE
             }
@@ -114,11 +138,17 @@ class LibraryScanner(
             override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
                 if (cancelled.get()) return FileVisitResult.TERMINATE
                 files++
+                require(files <= MAX_DISCOVERED_FILES) { "Library has too many files" }
                 if (!attrs.isRegularFile || Files.isSymbolicLink(file) || file.fileName.toString().startsWith(".")) return FileVisitResult.CONTINUE
                 val relative = realRoot.relativize(file)
                 val folder = relative.parent?.toString()?.replace('\\', '/') ?: ""
-                classifyMedia(file.fileName.toString())?.let { candidates += MediaCandidate(folder, file.fileName.toString(), it) }
+                classifyMedia(file.fileName.toString())?.let {
+                    require(candidates.size < MAX_MEDIA_CANDIDATES) { "Library has too many media candidates" }
+                    candidates += MediaCandidate(folder, file.fileName.toString(), it)
+                }
                 if (file.fileName.toString().substringAfterLast('.', "").equals("xmp", true)) {
+                    sidecarEntries++
+                    require(sidecarEntries <= MAX_SIDECAR_ENTRIES) { "Library has too many XMP sidecars" }
                     val inner = file.fileName.toString().substringBeforeLast('.')
                     if (classifyMedia(inner) != null) ambiguousSidecars += folder to caseFoldText(inner.substringBeforeLast('.'))
                     else canonicalSidecars.getOrPut(folder to caseFoldText(inner)) { mutableListOf() }.add(file.fileName.toString())
@@ -128,8 +158,10 @@ class LibraryScanner(
         })
         if (cancelled.get()) throw InterruptedException("Synchronization cancelled")
         val paired = pairCandidates(candidates, ambiguousSidecars, canonicalSidecars)
+        require(paired.size <= MAX_SCANNED_PHOTOS) { "Library has too many paired photos" }
         progress(SyncStatus(SyncPhase.METADATA, directories, files, 0, 0, "", true, "Pareamento concluído; lendo metadados", totalPhotos = paired.size))
         var errors = 0
+        var unavailablePreviews = 0
         return SecureLibraryBoundary(realRoot, false).use { boundary ->
             val photos = paired.mapIndexed { index, pair ->
                 if (cancelled.get()) throw InterruptedException("Synchronization cancelled")
@@ -138,16 +170,34 @@ class LibraryScanner(
                 val relativePreview = pair.jpeg?.let { if (pair.folder.isEmpty()) it else "${pair.folder}/$it" } ?: relativeSource
                 val kind = if (pair.raw != null) MediaKind.RAW else MediaKind.JPEG
                 val sourceBefore = boundary.readExpectation(relativeSource) ?: error("Media disappeared before metadata read")
+                var readChanged = false
                 val observed = if (sourceBefore.size !in 1..MAX_METADATA_SOURCE_BYTES) {
                     ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-source-size")
-                } else observeSecurely(boundary, relativeSource, kind)
+                } else try {
+                    observeSecurely(boundary, relativeSource, kind, sourceBefore)
+                } catch (_: LibraryReadChangedException) {
+                    readChanged = true
+                    ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "media-changed-during-read")
+                } catch (error: Exception) {
+                    ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-read-failed:${error.javaClass.simpleName}".take(160))
+                }
                 val sourceAfter = boundary.readExpectation(relativeSource)
-                val stableRead = sourceBefore == sourceAfter
+                val stableRead = !readChanged && sourceBefore == sourceAfter
                 val metadata = if (stableRead) observed else ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "media-changed-during-read")
                 if (metadata.errorCode != null) errors++
                 progress(SyncStatus(SyncPhase.METADATA, directories, files, index + 1, errors, authorityName.take(160), true, "Lendo metadados", totalPhotos = paired.size))
                 val authorityPath = if (pair.folder.isEmpty()) (pair.xmp ?: authorityName.substringBeforeLast('.') + ".xmp") else pair.folder + "/" + (pair.xmp ?: authorityName.substringBeforeLast('.') + ".xmp")
                 val previewIdentity = boundary.readExpectation(relativePreview) ?: error("Preview media disappeared during scan")
+                // A paired JPEG is the image actually displayed. The RAW's embedded preview is smaller,
+                // so its dimensions must never be reported as the photograph's resolution.
+                val reported = if (pair.raw != null && pair.jpeg != null && stableRead) {
+                    val jpeg = runCatching { observeSecurely(boundary, relativePreview, MediaKind.JPEG, previewIdentity) }.getOrNull()
+                    if (jpeg != null && jpeg.status == MetadataStatus.AVAILABLE && jpeg.width != null && jpeg.height != null) {
+                        metadata.copy(width = jpeg.width, height = jpeg.height)
+                    } else metadata
+                } else metadata
+                val previewPlan = previewPlanFor(boundary, pair, relativePreview, previewIdentity)
+                if (!previewPlan.available) unavailablePreviews++
                 Photo(
                     id = stableId("$relativeSource\u0000$authorityPath"),
                     folder = pair.folder,
@@ -158,22 +208,85 @@ class LibraryScanner(
                     previewPath = relativePreview,
                     sourceIdentity = sourceAfter?.toMediaIdentity(relativeSource),
                     previewIdentity = previewIdentity.toMediaIdentity(relativePreview),
-                    metadata = metadata,
+                    metadata = reported,
                     writable = pair.writable && stableRead,
                     issue = pair.issue ?: if (!stableRead) "Media changed during metadata read" else null,
+                    previewPlan = previewPlan,
                 )
             }
-            ScanResult(photos, errors)
+            ScanResult(photos, errors, unavailablePreviews)
         }
+    }
+
+    /**
+     * Proves once, during sync, how this photograph's preview is produced. The stored plan holds
+     * strategy, byte interval and dimensions, so a later preview load never has to rediscover the
+     * format or decide between extractors.
+     */
+    private fun previewPlanFor(
+        boundary: SecureLibraryBoundary,
+        pair: PairingResult,
+        relativePreview: String,
+        expected: SecureLibraryBoundary.ReadExpectation,
+    ): PreviewPlan {
+        val rawOnly = pair.raw != null && pair.jpeg == null
+        if (!rawOnly) {
+            val strategy = if (pair.jpeg != null && pair.raw != null) PreviewStrategy.PAIRED_JPEG else PreviewStrategy.DIRECT_JPEG
+            return runCatching {
+                boundary.withAttestedRead(relativePreview, MAX_METADATA_SOURCE_BYTES, expected) { channel, attested ->
+                    PreviewPlanner.jpeg(channel, attested.size, strategy)
+                }
+            }.getOrElse { PreviewPlanner.unavailable(strategy, "preview-read-failed") }
+        }
+        val extension = relativePreview.substringAfterLast('.', "").lowercase()
+        if (extension !in setOf("cr2", "dng", "cr3", "raf")) {
+            return PreviewPlanner.unavailable(PreviewStrategy.CONTAINER_EMBEDDED, "raw-preview-unsupported")
+        }
+        return runCatching {
+            boundary.withAttestedRead(relativePreview, MAX_METADATA_SOURCE_BYTES, expected) { channel, attested ->
+                when (extension) {
+                    "cr2", "dng" -> {
+                        val format = if (extension == "dng") ImageFormat.DNG else ImageFormat.CR2
+                        val reader = BoundedFileChannelByteReader(channel, attested.size, MAX_PREVIEW_PARSER_WORK_BYTES)
+                        val contents = TiffReader.read(reader, false, 0)
+                        val tiffMetadata = runCatching { metadataFromTiff(contents, format).convertToPhotoMetadata() }.getOrNull()
+                        val orientation = tiffMetadata?.orientation?.name
+                        val plan = PreviewPlanner.tiffEmbedded(channel, attested.size, contents, orientation)
+                        if (plan.available || format != ImageFormat.DNG) plan
+                        else PreviewPlanner.fullDecode(tiffMetadata?.widthPx ?: 0, tiffMetadata?.heightPx ?: 0, orientation)
+                    }
+                    else -> {
+                        val embedded = Kim.extractPreviewImage(BoundedFileChannelByteReader(channel, attested.size, MAX_PREVIEW_PARSER_WORK_BYTES))
+                        val dimensions = embedded?.let { jpegFrameSize(it) }
+                        if (dimensions == null) PreviewPlanner.unavailable(PreviewStrategy.CONTAINER_EMBEDDED, "raw-embedded-preview-missing")
+                        else PreviewPlanner.containerEmbedded(dimensions.first, dimensions.second, null)
+                    }
+                }
+            }
+        }.getOrElse { PreviewPlanner.unavailable(PreviewStrategy.TIFF_EMBEDDED, "raw-preview-read-failed") }
     }
 
     private fun observeSecurely(
         boundary: SecureLibraryBoundary,
         relative: String,
         kind: MediaKind,
+        expected: SecureLibraryBoundary.ReadExpectation,
     ): ObservedMetadata {
-        val bytes = boundary.readOnceAttested(relative, MAX_METADATA_SOURCE_BYTES.toInt())
-        return observer.observe(bytes, kind)
+        if (observer !is KimMediaObservationAdapter) {
+            val bytes = boundary.readOnceAttested(relative, MAX_METADATA_SOURCE_BYTES.toInt())
+            return observer.observe(bytes, kind)
+        }
+        val format = when (relative.substringAfterLast('.', "").lowercase()) {
+            "cr2" -> ImageFormat.CR2
+            "cr3" -> ImageFormat.CR3
+            "dng" -> ImageFormat.DNG
+            "raf" -> ImageFormat.RAF
+            "jpg", "jpeg" -> ImageFormat.JPEG
+            else -> return ObservedMetadata(status = MetadataStatus.ERROR, errorCode = "metadata-unsupported")
+        }
+        return boundary.withAttestedRead(relative, MAX_METADATA_SOURCE_BYTES, expected) { channel, attested ->
+            observer.observe(channel, attested.size, format)
+        }
     }
 
     private fun SecureLibraryBoundary.ReadExpectation.toMediaIdentity(path: String) =

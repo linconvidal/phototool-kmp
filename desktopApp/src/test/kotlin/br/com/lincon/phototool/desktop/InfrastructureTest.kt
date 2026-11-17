@@ -34,7 +34,7 @@ class InfrastructureTest {
         val store=XmpSidecarStore(root,true); val original=sidecar.readBytes(); val mtime=sidecar.getLastModifiedTime()
         assertEquals(EditorialState(),store.mutate(photo,EditorialState())); assertContentEquals(original,sidecar.readBytes()); assertEquals(mtime,sidecar.getLastModifiedTime())
         val state=store.mutate(photo,EditorialState(Flag.PICK,5,ColorLabel.GREEN,listOf("São Paulo")))
-        val written=sidecar.readText(); assertEquals(Flag.PICK,state.flag); assertContains(written,"pick=\"1\""); assertContains(written,"good=\"True\""); assertContains(written,"Rating=\"5\""); assertContains(written,"keep=\"yes\""); assertContains(written,"keep-comment"); assertContentEquals(beforeRaw,raw.readBytes()); assertEquals(1,root.listDirectoryEntries(".IMG.xmp.previous.*.xmp").size)
+        val written=sidecar.readText(); assertEquals(Flag.PICK,state.flag); assertContains(written,"pick=\"1\""); assertContains(written,"good=\"True\""); assertContains(written,"Rating=\"5\""); assertContains(written,"keep=\"yes\""); assertContains(written,"keep-comment"); assertContentEquals(beforeRaw,raw.readBytes()); assertTrue(root.listDirectoryEntries(".IMG.xmp.previous.*.xmp").isEmpty())
     }
 
     @Test fun pickIsAuthoritativeAndUnrelatedEditsPreserveIndependentGoodBytes() {
@@ -128,20 +128,20 @@ class InfrastructureTest {
         assertTrue(metadata.isNotEmpty()); assertTrue(metadata.all { it.totalPhotos == 2 }); assertEquals(2,metadata.last().photos)
     }
 
-    @Test fun completedEditIsReplayedWhenItRacesWithStaleSnapshotPublication() {
+    @Test fun completedEditIsReplayedWhenItRacesWithDesktopStatePublication() {
         val root=createTempDirectory(); root.resolve("A.JPG").writeBytes(byteArrayOf(1)); val cache=PhotoCache(createTempDirectory(),root)
-        val observed=scanPhoto(root).copy(editorial=EditorialState(rating=0)); val ledger=EditorialRevisionLedger(); ledger.seedMissing(listOf(observed))
+        val observed=scanPhoto(root).copy(editorial=EditorialState(rating=0)); val ledger=EditorialRevisionLedger()
+        cache.publish(listOf(observed)); val persisted=cache.load(); ledger.acceptAuthoritative(persisted)
         val publicationPrepared=CountDownLatch(1); val releasePublication=CountDownLatch(1); val executor=Executors.newSingleThreadExecutor()
-        val future=executor.submit<ReconciledPublication> {
-            publishReconciledSnapshot(cache,listOf(observed),ledger) {
-                publicationPrepared.countDown(); assertTrue(releasePublication.await(5,TimeUnit.SECONDS))
-            }
+        val future=executor.submit<List<Photo>> {
+            publicationPrepared.countDown(); assertTrue(releasePublication.await(5,TimeUnit.SECONDS))
+            ledger.overlayAndAccept(persisted)
         }
         assertTrue(publicationPrepared.await(5,TimeUnit.SECONDS))
-        val confirmed=observed.editorial.copy(rating=5); ledger.record(observed.id,confirmed)
+        val confirmed=observed.editorial.copy(rating=5); ledger.record(observed.id,confirmed); cache.updateEditorial(observed.id,confirmed)
         releasePublication.countDown(); val publication=future.get(5,TimeUnit.SECONDS)
         executor.shutdown(); assertTrue(executor.awaitTermination(5,TimeUnit.SECONDS))
-        assertEquals(5,publication.photos.single().editorial.rating)
+        assertEquals(5,publication.single().editorial.rating)
         assertEquals(5,cache.load().single().editorial.rating)
     }
 
@@ -201,7 +201,7 @@ class InfrastructureTest {
         val photo=Photo("f","","IMG_1234","IMG_1234.xmp",rawPath="IMG_1234.RAF",sourceIdentity=identity(root,raf))
         val store=FujiProfileStore(root,true); val before=fp2.readBytes(); val mtime=fp2.getLastModifiedTime()
         assertEquals("0",store.mutate(photo,mapOf("ExposureBias" to "0")).exposureBias); assertContentEquals(before,fp2.readBytes()); assertEquals(mtime,fp2.getLastModifiedTime())
-        assertEquals("P0P33",store.mutate(photo,mapOf("ExposureBias" to "P0P33")).exposureBias); assertEquals(1,root.listDirectoryEntries(".IMG_1234.FP2.previous.*.fp2").size); assertContains(fp2.readText(),"preserve-me")
+        assertEquals("P0P33",store.mutate(photo,mapOf("ExposureBias" to "P0P33")).exposureBias); assertTrue(root.listDirectoryEntries(".IMG_1234.FP2.previous.*.fp2").isEmpty()); assertContains(fp2.readText(),"preserve-me")
         fp2.deleteExisting(); root.listDirectoryEntries(".IMG_1234.FP2.previous.*.fp2").forEach { it.deleteExisting() }; root.resolve("IMG_1234.FP3").writeBytes(Paths.get("..","fixtures","xpro2-rendered.FP3").readBytes())
         assertFalse(store.read(photo)!!.editable); assertFails { store.mutate(photo,mapOf("Color" to "1")) }
     }
@@ -232,6 +232,83 @@ class InfrastructureTest {
         ImageIO.read(thumbnail.toFile()).also { assertEquals(512,maxOf(it.width,it.height)); assertTrue(it.width.toLong()*it.height<=20_000_000) }
         jpeg.writeBytes(jpeg.readBytes()+byteArrayOf(0))
         assertFailsWith<PreviewException> { PreviewStore(root,cache).thumbnail(photo,512) }
+    }
+
+    @Test fun originalJpegKeepsFullDimensionsAndBytesOutsideThePreviewLimit() {
+        val root=createTempDirectory("phototool-original"); val cache=createTempDirectory("phototool-original-preview")
+        val jpeg=root.resolve("FULL.JPG"); val image=BufferedImage(4200,2800,BufferedImage.TYPE_INT_RGB)
+        image.createGraphics().use { it.color=Color(20,80,140); it.fillRect(0,0,image.width,image.height) }
+        assertTrue(ImageIO.write(image,"jpeg",jpeg.toFile()))
+        val photo=LibraryScanner().scan(root,AtomicBoolean()){ }.photos.single()
+        PreviewStore(root,cache).use { store ->
+            val original=store.originalJpegBytes(photo)
+            assertContentEquals(jpeg.readBytes(),original.bytes)
+            ImageIO.read(original.bytes.inputStream()).also {
+                assertEquals(4200,it.width); assertEquals(2800,it.height); assertTrue(maxOf(it.width,it.height)>4096)
+            }
+            assertContentEquals(jpeg.readBytes(),jpeg.readBytes())
+        }
+        jpeg.writeBytes(jpeg.readBytes()+byteArrayOf(0))
+        val changed=PreviewStore(root,cache)
+        val error=assertFailsWith<PreviewException> { changed.originalJpegBytes(photo) }
+        assertEquals(PreviewFailure.STALE_SOURCE,error.failure)
+    }
+
+    @Test fun originalJpegIsRefusedForRawOnlyPhotos() {
+        val root=createTempDirectory("phototool-original-raw"); val cache=createTempDirectory("phototool-original-raw-preview")
+        val raw=root.resolve("ONLY.RAF"); raw.writeBytes(byteArrayOf(1,2,3,4))
+        val photo=Photo("r","","ONLY","ONLY.xmp",rawPath="ONLY.RAF",previewPath="ONLY.RAF",
+            sourceIdentity=identity(root,raw),previewIdentity=identity(root,raw))
+        PreviewStore(root,cache).use { store ->
+            val error=assertFailsWith<PreviewException> { store.originalJpegBytes(photo) }
+            assertEquals(PreviewFailure.UNSUPPORTED_MEDIA,error.failure)
+        }
+    }
+
+    @Test fun pairedJpegDimensionsAreReportedInsteadOfTheRawEmbeddedPreview() {
+        val root=createTempDirectory("phototool-pair-dimensions")
+        root.resolve("PAIR.RAF").writeBytes("raw-authority".toByteArray())
+        root.resolve("PAIR.JPG").writeBytes("jpeg-preview-bytes".toByteArray())
+        val adapter=object:MediaObservationAdapter {
+            override fun observe(bytes: ByteArray, kind: MediaKind): ObservedMetadata =
+                if (kind == MediaKind.JPEG) ObservedMetadata(status=MetadataStatus.AVAILABLE,width=6000,height=4000)
+                else ObservedMetadata(status=MetadataStatus.AVAILABLE,width=1920,height=1280)
+        }
+        val photo=LibraryScanner(adapter).scan(root,AtomicBoolean()){ }.photos.single()
+        assertEquals(6000,photo.metadata.width)
+        assertEquals(4000,photo.metadata.height)
+        assertEquals("PAIR.RAF",photo.rawPath)
+        assertEquals("PAIR.JPG",photo.jpegPath)
+    }
+
+    @Test fun nativeRegionReturnsExactPixelsAndRejectsUnsafeBounds() {
+        val root=createTempDirectory("phototool-region"); val cache=createTempDirectory("phototool-region-preview")
+        val jpeg=root.resolve("REGION.JPG"); val image=BufferedImage(4200,2800,BufferedImage.TYPE_INT_RGB)
+        image.createGraphics().use { g ->
+            g.color=Color(200,30,40); g.fillRect(0,0,2100,1400)
+            g.color=Color(30,40,200); g.fillRect(2100,0,2100,1400)
+            g.color=Color(30,200,60); g.fillRect(0,1400,2100,1400)
+            g.color=Color(240,220,40); g.fillRect(2100,1400,2100,1400)
+        }
+        assertTrue(ImageIO.write(image,"jpeg",jpeg.toFile()))
+        val photo=LibraryScanner().scan(root,AtomicBoolean()){ }.photos.single()
+        PreviewStore(root,cache).use { store ->
+            val region=store.regionJpegBytes(photo,3000,200,400,300)
+            val decoded=ImageIO.read(region.bytes.inputStream())
+            assertEquals(400,decoded.width); assertEquals(300,decoded.height)
+            val center=Color(decoded.getRGB(200,150))
+            assertTrue(center.blue>120 && center.red<110, "Expected the blue quadrant, got $center")
+            assertEquals(region.bytes.size,store.regionJpegBytes(photo,3000,200,400,300).bytes.size)
+            assertFailsWith<PreviewException> { store.regionJpegBytes(photo,4000,2700,400,300) }
+            assertFailsWith<PreviewException> { store.regionJpegBytes(photo,-1,0,10,10) }
+            assertFailsWith<PreviewException> { store.regionJpegBytes(photo,0,0,4096,4096) }
+        }
+        val raw=root.resolve("ONLY.RAF"); raw.writeBytes(byteArrayOf(1,2,3,4))
+        val rawPhoto=Photo("r","","ONLY","ONLY.xmp",rawPath="ONLY.RAF",previewPath="ONLY.RAF",
+            sourceIdentity=identity(root,raw),previewIdentity=identity(root,raw))
+        PreviewStore(root,cache).use { store ->
+            assertFailsWith<PreviewException> { store.regionJpegBytes(rawPhoto,0,0,10,10) }
+        }
     }
 
     @Test fun tiffOrientationIsAppliedBeforePublishingPreviews() {
@@ -424,7 +501,7 @@ class InfrastructureTest {
             controller.callbacks.synchronize()
             controller.awaitBackgroundWork()
             assertEquals(SyncPhase.COMPLETE,controller.state.sync.phase); assertEquals(1,controller.state.photos.size)
-            assertTrue(cache.resolve("previews").listDirectoryEntries().isEmpty(),"synchronization must not generate previews")
+            assertTrue(!cache.resolve("previews").exists() || cache.resolve("previews").listDirectoryEntries().isEmpty(),"synchronization must not generate previews")
         } finally { controller.close() }
     }
 
@@ -505,10 +582,15 @@ class InfrastructureTest {
     }
 
     @Test fun corruptCacheRowsAndSqliteAuxiliariesAreRejected() {
-        val root=createTempDirectory(); root.resolve("C.JPG").writeBytes(byteArrayOf(1)); val cacheDir=createTempDirectory(); val cache=PhotoCache(cacheDir,root); cache.publish(listOf(scanPhoto(root)))
+        val root=createTempDirectory(); root.resolve("C.JPG").writeBytes(byteArrayOf(1)); val cacheDir=createTempDirectory(); val cache=PhotoCache(cacheDir,root); val photo=scanPhoto(root); cache.publish(listOf(photo))
         java.sql.DriverManager.getConnection("jdbc:sqlite:${cacheDir.resolve("phototool.sqlite3")}").use { it.createStatement().executeUpdate("UPDATE photos SET authority='C.xml'") }
         assertTrue(cache.load().isEmpty())
-        cacheDir.resolve("phototool.sqlite3-wal").writeBytes(byteArrayOf(1)); assertTrue(cache.load().isEmpty())
+        cacheDir.resolve("phototool.sqlite3-wal").writeBytes(byteArrayOf(1))
+        assertTrue(cache.load().isEmpty())
+        assertTrue(cache.loadCacheOnly().isEmpty())
+        cache.publish(listOf(photo.copy(editorial = EditorialState(rating = 5))))
+        assertFalse(cacheDir.resolve("phototool.sqlite3-wal").exists())
+        assertEquals(5, cache.loadCacheOnly().single().editorial.rating)
     }
 
     @Test fun hardlinkedThumbnailIsNeverTouchedOrReplaced() {
@@ -718,8 +800,9 @@ class InfrastructureTest {
         val preview=PreviewStore(root,cache) {
             if (!swapped) { swapped=true; val replacement=root.resolve("next.JPG"); ImageIO.write(BufferedImage(321,201,BufferedImage.TYPE_INT_RGB),"jpeg",replacement.toFile()); Files.move(replacement,jpeg,StandardCopyOption.REPLACE_EXISTING) }
         }
-        assertFailsWith<PreviewException> { preview.thumbnail(photo,256) }
-        assertTrue(cache.resolve("previews").listDirectoryEntries().isEmpty(),"preview failure must remove secure-copy and publication temporaries")
+        val failure=assertFailsWith<PreviewException> { preview.thumbnail(photo,256) }
+        assertEquals(PreviewFailure.STALE_SOURCE,failure.failure)
+        assertTrue(cache.resolve("previews").listDirectoryEntries().isEmpty(),"preview failure must remove source and publication temporaries")
     }
 
     @Test fun cacheSeparationRejectsPhysicalAliasAndXmpPublishRejectsNewHardlink() {
@@ -997,6 +1080,70 @@ class InfrastructureTest {
             release.countDown(); transfer.get(5,TimeUnit.SECONDS); assertEquals("P0P33",sourceMutation.get(5,TimeUnit.SECONDS).exposureBias)
         } finally {
             release.countDown(); executor.shutdown(); assertTrue(executor.awaitTermination(5,TimeUnit.SECONDS)); fuji.close(); xmp.close()
+        }
+    }
+
+    @Test fun largeDngMetadataUsesBoundedRandomAccessPastTheFormer128MiBLimit() {
+        val root=createTempDirectory(); val dng=root.resolve("LARGE.DNG")
+        assertTrue(ImageIO.write(BufferedImage(32,20,BufferedImage.TYPE_INT_RGB),"tiff",dng.toFile()))
+        FileChannel.open(dng,StandardOpenOption.WRITE).use { channel ->
+            channel.position(129L*1024*1024); channel.write(java.nio.ByteBuffer.wrap(byteArrayOf(0)))
+        }
+        val result=LibraryScanner().scan(root,AtomicBoolean()){ }
+        val photo=result.photos.single()
+        assertEquals(0,result.errors); assertEquals(MetadataStatus.AVAILABLE,photo.metadata.status)
+        assertEquals(32,photo.metadata.width); assertEquals(20,photo.metadata.height)
+        assertTrue(photo.sourceIdentity!!.size > 128L*1024*1024)
+    }
+
+    @Test fun dngTiffFallbackProducesBoundedPreviewWithoutSourceCopiesOrLeaks() {
+        val root=createTempDirectory(); val cache=createTempDirectory(); val dng=root.resolve("FALLBACK.DNG")
+        val image=BufferedImage(640,360,BufferedImage.TYPE_INT_RGB).also { value ->
+            value.createGraphics().use { graphics -> graphics.color=Color(18,72,120); graphics.fillRect(0,0,value.width,value.height) }
+        }
+        assertTrue(ImageIO.write(image,"tiff",dng.toFile()))
+        val photo=LibraryScanner().scan(root,AtomicBoolean()){ }.photos.single()
+        PreviewStore(root,cache).use { store ->
+            val thumbnail=store.thumbnail(photo,256); val decoded=ImageIO.read(thumbnail.toFile())
+            assertEquals(256,maxOf(decoded.width,decoded.height))
+        }
+        val entries=cache.resolve("previews").listDirectoryEntries()
+        assertEquals(1,entries.count { it.extension=="jpg" })
+        assertTrue(entries.none { it.name.endsWith(".tmp") || it.name.startsWith(".source-") })
+    }
+
+    @Test fun malformedTiffIsIsolatedAsUnsupportedPreviewAndLeavesNoTemporaries() {
+        val root=createTempDirectory(); val cache=createTempDirectory(); root.resolve("BROKEN.CR2").writeBytes(ByteArray(4096))
+        val scan=LibraryScanner().scan(root,AtomicBoolean()){ }; val photo=scan.photos.single()
+        assertEquals(MetadataStatus.ERROR,photo.metadata.status)
+        PreviewStore(root,cache).use { store ->
+            val failure=assertFailsWith<PreviewException> { store.thumbnail(photo,256) }
+            assertEquals(PreviewFailure.UNSUPPORTED_MEDIA,failure.failure)
+        }
+        assertTrue(cache.resolve("previews").listDirectoryEntries().none { it.name.endsWith(".tmp") || it.name.startsWith(".source-") })
+    }
+
+    @Test fun validLargeXmpAndStandardMinusOneRatingRemainReadableAndByteStable() {
+        val root=createTempDirectory(); val raw=root.resolve("L.CR2"); raw.writeBytes(byteArrayOf(1)); val xmp=root.resolve("L.xmp")
+        val prefix="""<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:custom="urn:test" xmp:Rating="-1"><custom:payload>"""
+        val suffix="</custom:payload></rdf:Description></rdf:RDF></x:xmpmeta>"
+        xmp.writeText(prefix+"x".repeat(16*1024*1024)+suffix)
+        val beforeSize=xmp.fileSize(); val beforeMtime=xmp.getLastModifiedTime()
+        val photo=Photo("large-xmp","","L","L.xmp",rawPath="L.CR2",sourceIdentity=identity(root,raw))
+        XmpSidecarStore(root,false).use { store -> assertEquals(0,store.read(photo).rating) }
+        assertEquals(beforeSize,xmp.fileSize()); assertEquals(beforeMtime,xmp.getLastModifiedTime())
+    }
+
+    @Test fun channelReadersEnforceChunkAndCumulativeWorkLimits() {
+        val path=createTempFile().also { it.writeBytes(byteArrayOf(1,2,3,4,5,6,7,8)) }
+        FileChannel.open(path,StandardOpenOption.READ).use { channel ->
+            val reader=BoundedFileChannelByteReader(channel,8,maximumWorkBytes=6,maximumChunkBytes=4)
+            assertContentEquals(byteArrayOf(1,2,3,4),reader.readBytes(4))
+            assertFailsWith<IllegalArgumentException> { reader.readBytes(5) }
+            assertFailsWith<IllegalArgumentException> { reader.readBytes(3) }
+            assertContentEquals(byteArrayOf(7,8),reader.readBytes(6,2))
+            assertEquals(6,reader.bytesRead)
+            assertEquals(8,reader.bytesFetched,"nearby positional reads must reuse one bounded page")
         }
     }
 
