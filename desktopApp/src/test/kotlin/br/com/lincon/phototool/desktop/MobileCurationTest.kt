@@ -519,6 +519,36 @@ class MobileCurationTest {
         }
     }
 
+    @Test fun concurrentProjectionReadersCooperateInsteadOfReportingBusy() {
+        val root = createTempDirectory("mobile-shared-library")
+        root.resolve("A.JPG").writeBytes(byteArrayOf(1, 2, 3))
+        val cacheDirectory = createTempDirectory("mobile-shared-cache")
+        PhotoCache(cacheDirectory, root).publish(listOf(scanPhoto(root)))
+        val first = PhotoCache(cacheDirectory, root, validateLibraryDescendantsOnOpen = false)
+        val second = PhotoCache(cacheDirectory, root, validateLibraryDescendantsOnOpen = false)
+        val reading = CountDownLatch(2)
+        val release = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        val held = listOf(first, second).map { cache ->
+            executor.submit {
+                cache.withSharedProjection {
+                    reading.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+            }
+        }
+        try {
+            assertTrue(reading.await(5, TimeUnit.SECONDS))
+            assertFailsWith<ProjectionBusyException> { first.withExclusiveProjection { Unit } }
+        } finally {
+            release.countDown()
+            held.forEach { it.get(5, TimeUnit.SECONDS) }
+            executor.shutdownNow()
+        }
+        // The operating-system lock must be released with the last reader.
+        first.withExclusiveProjection { Unit }
+    }
+
     @Test fun synchronizationMarksDegradedBeforePublishingIncompleteXmpReadback() {
         val photo = samplePhoto("sync-xmp-error")
         val projection = MemoryProjection(listOf(photo))

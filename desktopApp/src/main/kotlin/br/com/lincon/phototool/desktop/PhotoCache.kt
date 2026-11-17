@@ -2,6 +2,8 @@ package br.com.lincon.phototool.desktop
 
 import br.com.lincon.phototool.domain.*
 import java.nio.channels.FileChannel
+import java.nio.channels.FileLock
+import java.nio.channels.OverlappingFileLockException
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.sql.Connection
@@ -13,6 +15,49 @@ private const val MAX_CACHE_KEYWORDS = 1_000_000
 private val CACHE_GENERATION_PATTERN = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 private data class CachedSnapshot(val photos: List<Photo>, val generation: String)
+
+/**
+ * Readers in one server run concurrently, but the file-lock API refuses a second lock over an
+ * overlapping region even when both are shared: the JVM would answer its own readers with
+ * [ProjectionBusyException]. The first participant takes the operating-system lock, which stays the
+ * boundary against other processes, and the remaining JVM readers share it through this gate.
+ */
+private class ProjectionLockGate {
+    private var readers = 0
+    private var writer = false
+    private var channel: FileChannel? = null
+    private var fileLock: FileLock? = null
+
+    fun <T> withLock(shared: Boolean, open: () -> FileChannel, block: () -> T): T {
+        synchronized(this) {
+            if (writer || !shared && readers > 0) throw ProjectionBusyException()
+            if (shared && readers > 0) readers++
+            else {
+                val opened = open()
+                val acquired = try { opened.tryLock(0L, Long.MAX_VALUE, shared) } catch (_: OverlappingFileLockException) { null }
+                if (acquired == null) {
+                    opened.close()
+                    throw ProjectionBusyException()
+                }
+                channel = opened
+                fileLock = acquired
+                if (shared) readers = 1 else writer = true
+            }
+        }
+        try { return block() } finally {
+            synchronized(this) {
+                if (shared) readers-- else writer = false
+                if (readers == 0 && !writer) release()
+            }
+        }
+    }
+
+    private fun release() {
+        val held = fileLock ?: return
+        fileLock = null
+        try { held.release() } finally { channel?.close(); channel = null }
+    }
+}
 
 class PhotoCache(
     private val cacheDir: Path,
@@ -197,13 +242,18 @@ class PhotoCache(
     private fun <T> withProjectionLock(shared: Boolean, block: () -> T): T {
         ensureFullSeparationProof()
         if (Files.exists(projectionLock, LinkOption.NOFOLLOW_LINKS)) check(safeRegular(projectionLock)) { "Editorial projection lock is unsafe" }
+        return projectionGates.computeIfAbsent(realCache) { ProjectionLockGate() }.withLock(shared, ::openProjectionLock, block)
+    }
+
+    private fun openProjectionLock(): FileChannel {
         val options = setOf<OpenOption>(StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)
-        FileChannel.open(projectionLock, options).use { channel ->
-            check(safeRegular(projectionLock)) { "Editorial projection lock is unsafe" }
-            val lock = try { channel.tryLock(0L, Long.MAX_VALUE, shared) } catch (_: java.nio.channels.OverlappingFileLockException) { null }
-                ?: throw ProjectionBusyException()
-            lock.use { return block() }
-        }
+        val channel = FileChannel.open(projectionLock, options)
+        try { check(safeRegular(projectionLock)) { "Editorial projection lock is unsafe" } } catch (failure: Throwable) { channel.close(); throw failure }
+        return channel
+    }
+
+    private companion object {
+        private val projectionGates = java.util.concurrent.ConcurrentHashMap<Path, ProjectionLockGate>()
     }
 
     @Synchronized

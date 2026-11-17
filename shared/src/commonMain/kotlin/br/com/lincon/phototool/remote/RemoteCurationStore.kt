@@ -7,6 +7,8 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+private val READ_RETRY_DELAYS_MS = longArrayOf(80, 200, 500)
+
 /** Translates UI actions to a bounded HTTP projection while retaining the production reducer. */
 class RemoteCurationStore(private val api: CurationReadApi, private val scope: CoroutineScope) {
     private val mutableState = MutableStateFlow(AppState(
@@ -121,9 +123,9 @@ class RemoteCurationStore(private val api: CurationReadApi, private val scope: C
         request = scope.launch {
             try {
                 if (debounce) delay(200)
-                val session = (api as? CurationEditorialApi)?.session()
-                val status = api.status()
-                val result = api.page(query, page)
+                val session = retryingRead { (api as? CurationEditorialApi)?.session() }
+                val status = retryingRead { api.status() }
+                val result = retryingRead { api.page(query, page) }
                 require(result.page == page && result.items.size <= result.pageSize && result.pageSize in 1..60)
                 require(result.snapshotGeneration == status.snapshotGeneration) { "Snapshot changed; refresh required" }
                 if (ticket != epoch) return@launch
@@ -177,15 +179,15 @@ class RemoteCurationStore(private val api: CurationReadApi, private val scope: C
         }
         request = scope.launch {
             try {
-                val result = api.detail(query, id)
+                val result = retryingRead { api.detail(query, id) }
                 require(result.id == id)
                 result.previousId?.let(::requirePhotoId)
                 result.nextId?.let(::requirePhotoId)
                 val photo = result.toPhoto()
                 if (ticket != epoch) return@launch
                 // A new snapshot must not reuse the old page, neighbor ordering or prepared previews.
-                val session = (api as? CurationEditorialApi)?.session()
-                val status = api.status()
+                val session = retryingRead { (api as? CurationEditorialApi)?.session() }
+                val status = retryingRead { api.status() }
                 if (ticket != epoch) return@launch
                 if (editorialTicket != editorialEpoch) { loadDetail(id); return@launch }
                 if (!mutationInFlight && status.snapshotGeneration != state.value.remote!!.generation) {
@@ -214,8 +216,8 @@ class RemoteCurationStore(private val api: CurationReadApi, private val scope: C
 
     private suspend fun validatePreparedDetail(detail: PendingRemoteDetail, editorialTicket: Int) {
         try {
-            val session = (api as? CurationEditorialApi)?.session()
-            val status = api.status()
+            val session = retryingRead { (api as? CurationEditorialApi)?.session() }
+            val status = retryingRead { api.status() }
             if (detail.ticket != epoch) return
             if (editorialTicket != editorialEpoch) { loadDetail(detail.photo.id); return }
             if (status.snapshotGeneration != state.value.remote!!.generation) {
@@ -377,6 +379,22 @@ class RemoteCurationStore(private val api: CurationReadApi, private val scope: C
         mutableState.value = current.copy(photos = current.photos.map { it.updated() }, remote = remote.copy(
             detail = remote.detail?.updated(), pendingDetail = remote.pendingDetail?.let { it.copy(photo = it.photo.updated()) }))
         navigationDetail = navigationDetail?.let { it.copy(photo = it.photo.updated()) }
+    }
+
+    /**
+     * Reads are idempotent, so a transient failure costs a short retry instead of a banner the user
+     * must dismiss. A busy projection lock and a dropped browser fetch both reach here as ordinary
+     * exceptions, and neither deserves asking the user to tap "Tentar novamente".
+     */
+    private suspend fun <T> retryingRead(block: suspend () -> T): T {
+        var attempt = 0
+        while (true) {
+            try { return block() } catch (cancelled: CancellationException) { throw cancelled } catch (failure: Throwable) {
+                val pause = READ_RETRY_DELAYS_MS.getOrNull(attempt) ?: throw failure
+                delay(pause)
+                attempt++
+            }
+        }
     }
 
     private fun fail(ticket: Int, message: String) {

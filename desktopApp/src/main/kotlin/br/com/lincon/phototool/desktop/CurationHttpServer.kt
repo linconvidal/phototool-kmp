@@ -47,6 +47,7 @@ import kotlinx.serialization.json.Json
 
 private const val MAX_MUTATION_BODY_BYTES = 4096
 private const val CSRF_HEADER = "X-PhotoTool-CSRF"
+private val IMMUTABLE_ASSET = Regex("(?:^|/)[0-9a-f]{16,}[^/]*\\.(?:js|mjs|wasm|css)$")
 
 internal data class HttpSecurityConfiguration(
     val allowedHosts: Set<String>,
@@ -110,8 +111,17 @@ internal fun Application.mobileCurationModule(
 
     intercept(ApplicationCallPipeline.Plugins) {
         val currentCall = context
-        if (currentCall.request.path().startsWith("/api/v1/") && !currentCall.request.path().endsWith("/preview")) {
+        val requestedPath = currentCall.request.path()
+        if (requestedPath.startsWith("/api/v1/") && !requestedPath.endsWith("/preview")) {
             currentCall.response.cacheControl(CacheControl.NoStore(null))
+        } else if (!requestedPath.startsWith("/api/v1/") && requestedPath != "/") {
+            // phototool.js, bootstrap.js and the stylesheet keep their names across publications, so a
+            // browser that cached them would run the previous build. Content-addressed assets never
+            // change under the same name and stay cacheable.
+            currentCall.response.cacheControl(
+                if (IMMUTABLE_ASSET.matches(requestedPath)) CacheControl.MaxAge(maxAgeSeconds = 31_536_000, visibility = CacheControl.Visibility.Public)
+                else CacheControl.NoCache(null),
+            )
         }
         // Compose/Skiko compiles Wasm and positions accessibility/input elements with inline styles.
         // No general JS eval, external scripts, or external API/image origins are allowed.
