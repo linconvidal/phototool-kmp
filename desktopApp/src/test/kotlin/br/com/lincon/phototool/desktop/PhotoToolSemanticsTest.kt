@@ -260,7 +260,7 @@ class PhotoToolSemanticsTest {
         val controls=listOf("SDRBrightness","SDRContrast","SDRClarity","SDRHighlights","SDRShadows","SDRWhites","SDRBlend").associateWith { 0 }
         val auxiliary=AuxiliaryActions(load={ AuxiliaryView(hdr=HdrView(true,"4.00",controls)) })
         setContent { PhotoToolApp(state,AppCallbacks(dispatch={},auxiliary=auxiliary),Modifier.onKeyEvent { fallback++; true }) }
-        onNodeWithContentDescription("Mostrar receitas e HDR").performClick()
+        onNodeWithContentDescription("Mostrar receitas e HDR").performScrollTo().performClick()
         onNodeWithContentDescription("Brilho SDR").performScrollTo().requestFocus().performKeyInput { pressKey(Key.DirectionRight) }
         assertEquals(0,fallback)
     }
@@ -491,7 +491,7 @@ class PhotoToolSemanticsTest {
         val writable=photo.copy(writable=true,rawPath="2025/IMG_1.RAF",jpegPath=null)
         val state=AppState(library="/copy",cache="/cache",photos=listOf(writable),selectedId=writable.id,screen=Screen.DETAIL,writeEnabled=true)
         setContent { PhotoToolApp(state,AppCallbacks(dispatch={},auxiliary=auxiliary)) }
-        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performClick(); waitForIdle()
+        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performScrollTo().performClick(); waitForIdle()
         onNodeWithContentDescription("Aumentar máximo HDR").performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
         waitUntil(timeoutMillis=5_000) { requested != null }
         assertEquals("3.00",requested?.maximum)
@@ -507,7 +507,7 @@ class PhotoToolSemanticsTest {
         val writable=photo.copy(writable=true,rawPath="2025/IMG_1.RAF",jpegPath=null)
         val state=AppState(library="/copy",cache="/cache",photos=listOf(writable),selectedId=writable.id,screen=Screen.DETAIL,writeEnabled=true)
         setContent { PhotoToolApp(state,AppCallbacks(dispatch={},auxiliary=auxiliary)) }
-        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performClick(); waitForIdle()
+        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performScrollTo().performClick(); waitForIdle()
         onNodeWithContentDescription("Brilho SDR").performScrollTo().performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { set -> set(-35f) }
         waitUntil(timeoutMillis=5_000) { requests.isNotEmpty() }
         onNodeWithContentDescription("Brilho SDR").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.SetProgress) { set -> set(67f) }
@@ -528,7 +528,7 @@ class PhotoToolSemanticsTest {
         val selected=photo.copy(writable=true,rawPath="2025/IMG_1.RAF",jpegPath=null)
         val state=AppState(library="/copy",cache="/cache",photos=listOf(selected),selectedId=selected.id,screen=Screen.DETAIL,writeEnabled=true)
         setContent { PhotoToolApp(state,AppCallbacks(dispatch={},auxiliary=AuxiliaryActions(load={ AuxiliaryView(fuji=recipe) }))) }
-        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performClick(); waitForIdle()
+        waitForIdle(); onNodeWithContentDescription("Mostrar receitas e HDR").performScrollTo().performClick(); waitForIdle()
         onNodeWithContentDescription("Diminuir exposição Fuji").performScrollTo().assertExists().assertIsEnabled()
         onNodeWithContentDescription("Aumentar exposição Fuji").assertExists().assertIsEnabled()
     }

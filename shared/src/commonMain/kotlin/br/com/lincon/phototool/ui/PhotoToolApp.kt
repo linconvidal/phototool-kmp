@@ -126,26 +126,30 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.ensureActive
 import kotlin.math.roundToInt
 
-private val Ink = Color(0xff100d0a)
-private val Stage = Color(0xff070504)
-private val Panel = Color(0xff17120e)
-private val Inspector = Color(0xff1d1711)
-private val Raised = Color(0xff261e17)
-private val RaisedHover = Color(0xff33271d)
-private val Hairline = Color(0xff4a3a2b)
-private val Amber = Color(0xffd7a33c)
-private val AmberWash = Color(0xff352817)
-private val ProofPaper = Color(0xff1b1510)
-private val TextPrimary = Color(0xfff1e8db)
-private val Muted = Color(0xffb5a895)
-private val Danger = Color(0xffd46e59)
-private val Focus = Color(0xfff1ca6a)
-private val PickGreen = Color(0xff91aa7f)
-private val LabelRed = Color(0xffcc695d)
-private val LabelYellow = Color(0xffd1aa4b)
-private val LabelGreen = Color(0xff88a17e)
-private val CompactShape = RoundedCornerShape(4.dp)
-private val ProofAnnotationStyle = TextStyle(fontFamily = FontFamily.Monospace, fontSize = 12.sp, lineHeight = 15.sp, letterSpacing = .4.sp, fontWeight = FontWeight.Medium)
+// Aero/Aqua identity. Every material, rim and accent comes from AeroTheme.kt; these
+// aliases keep the call sites readable and paint-only.
+private val Ink = Aero.ink0
+private val Stage = Color(0xff04070e)
+private val Panel = Aero.ink1
+private val Inspector = Aero.ink2
+private val Raised = Aero.ink3
+private val RaisedHover = Aero.ink4
+private val Hairline = Color(0xff26374d)
+private val Accent = Aero.sky
+private val AccentWash = Color(0xff10304a)
+private val Sunken = Color(0xff061020)
+private val TextPrimary = Aero.text
+private val Muted = Aero.text3
+private val Danger = Aero.rose
+private val Focus = Aero.sky
+private val Mint = Aero.mint
+private val Caution = Aero.amber
+private val LabelRed = Aero.rose
+private val LabelYellow = Aero.amber
+private val LabelGreen = Aero.mint
+private val CompactShape = RoundedCornerShape(6.dp)
+private val CardShape = RoundedCornerShape(7.dp)
+private val FlatShape = RoundedCornerShape(0.dp)
 
 private val Add: ImageVector get() = Icons.Outlined.AddVector
 private val ArrowBack: ImageVector get() = Icons.Outlined.ArrowBackVector
@@ -199,37 +203,44 @@ private val Tune: ImageVector get() = Icons.Outlined.TuneVector
 private val ZoomIn: ImageVector get() = Icons.Outlined.ZoomInVector
 private val ZoomOut: ImageVector get() = Icons.Outlined.ZoomOutVector
 
+/** Material buttons paint nothing themselves: the gel brush comes from [aeroGel]. */
+@Composable
+private fun gelButtonColors() = ButtonDefaults.buttonColors(
+    containerColor = Color.Transparent,
+    contentColor = Ink,
+    disabledContainerColor = Color.Transparent,
+    disabledContentColor = Ink.copy(alpha = .45f),
+)
+
 @Composable
 fun PhotoToolTheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = darkColorScheme(
-            primary = Amber,
+            primary = Aero.sky,
             onPrimary = Ink,
+            primaryContainer = Aero.sky3,
+            onPrimaryContainer = Aero.text,
+            secondary = Aero.mint,
+            onSecondary = Ink,
             background = Ink,
             onBackground = TextPrimary,
             surface = Panel,
             onSurface = TextPrimary,
             surfaceVariant = Raised,
             onSurfaceVariant = Muted,
+            surfaceContainerHighest = Raised,
             outline = Hairline,
+            outlineVariant = Aero.edge,
             error = Danger,
+            onError = Ink,
         ),
-        typography = Typography(
-            bodyLarge = Typography().bodyLarge.copy(fontFamily = FontFamily.SansSerif, fontSize = 15.sp, lineHeight = 22.sp),
-            bodyMedium = Typography().bodyMedium.copy(fontFamily = FontFamily.SansSerif, fontSize = 14.sp, lineHeight = 20.sp),
-            bodySmall = Typography().bodySmall.copy(fontFamily = FontFamily.SansSerif, fontSize = 13.sp, lineHeight = 18.sp),
-            labelLarge = Typography().labelLarge.copy(fontFamily = FontFamily.SansSerif, fontSize = 13.sp, fontWeight = FontWeight.SemiBold),
-            labelMedium = Typography().labelMedium.copy(fontFamily = FontFamily.Monospace, fontSize = 12.sp, letterSpacing = .45.sp),
-            labelSmall = Typography().labelSmall.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp, letterSpacing = .35.sp),
-            titleMedium = Typography().titleMedium.copy(fontFamily = FontFamily.SansSerif, fontSize = 18.sp, letterSpacing = (-.2).sp, fontWeight = FontWeight.SemiBold),
-            titleLarge = Typography().titleLarge.copy(fontFamily = FontFamily.SansSerif, fontSize = 23.sp, letterSpacing = (-.35).sp, fontWeight = FontWeight.SemiBold),
-        ),
+        typography = aeroTypography(),
         shapes = Shapes(
-            extraSmall = RoundedCornerShape(3.dp),
-            small = RoundedCornerShape(5.dp),
+            extraSmall = RoundedCornerShape(5.dp),
+            small = RoundedCornerShape(6.dp),
             medium = CompactShape,
-            large = RoundedCornerShape(7.dp),
-            extraLarge = RoundedCornerShape(5.dp),
+            large = RoundedCornerShape(9.dp),
+            extraLarge = RoundedCornerShape(11.dp),
         ),
         content = content,
     )
@@ -242,7 +253,7 @@ private fun PhotoToolMark(modifier: Modifier = Modifier) = Canvas(modifier.seman
     val top = size.height * .22f
     val right = size.width * .88f
     val bottom = size.height * .78f
-    drawRect(Amber, topLeft = Offset(left, top), size = androidx.compose.ui.geometry.Size(right - left, bottom - top), style = Stroke(stroke))
+    drawRect(Accent, topLeft = Offset(left, top), size = androidx.compose.ui.geometry.Size(right - left, bottom - top), style = Stroke(stroke))
     val corner = size.minDimension * .16f
     listOf(
         Offset(left + stroke, top + corner) to Offset(left + stroke, top + stroke),
@@ -253,8 +264,8 @@ private fun PhotoToolMark(modifier: Modifier = Modifier) = Canvas(modifier.seman
         Offset(left + stroke, bottom - stroke) to Offset(left + corner, bottom - stroke),
         Offset(right - corner, bottom - stroke) to Offset(right - stroke, bottom - stroke),
         Offset(right - stroke, bottom - stroke) to Offset(right - stroke, bottom - corner),
-    ).forEach { (start, end) -> drawLine(Amber, start, end, strokeWidth = stroke) }
-    drawCircle(Amber, radius = size.minDimension * .045f, center = Offset(size.width * .76f, size.height * .50f))
+    ).forEach { (start, end) -> drawLine(Accent, start, end, strokeWidth = stroke) }
+    drawCircle(Accent, radius = size.minDimension * .045f, center = Offset(size.width * .76f, size.height * .50f))
 }
 
 @Composable
@@ -274,14 +285,21 @@ private fun AppIconButton(
         modifier = modifier.sizeIn(minWidth = 44.dp, minHeight = 44.dp)
             .onFocusChanged { focused = it.isFocused }
             .clip(CompactShape)
-            .background(when { selected -> AmberWash; pressed -> RaisedHover; hovered -> Raised; else -> Color.Transparent })
-            .then(when { focused -> Modifier.border(2.dp, Focus, CompactShape); selected -> Modifier.border(1.dp, Amber.copy(alpha = .66f), CompactShape); hovered -> Modifier.border(1.dp, Hairline, CompactShape); else -> Modifier })
+            .then(
+                when {
+                    selected -> Modifier.background(AccentWash).aeroRim(CompactShape, Aero.accentRim)
+                    pressed -> Modifier.background(RaisedHover)
+                    hovered -> Modifier.background(Aero.card).aeroRim(CompactShape)
+                    else -> Modifier
+                },
+            )
+            .then(if (focused) Modifier.border(2.dp, Focus, CompactShape) else Modifier)
             .hoverable(interaction, enabled)
             .clickable(interactionSource = interaction, indication = null, enabled = enabled, onClick = onClick)
             .semantics { contentDescription = description; this.selected = selected },
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, null, tint = when { !enabled -> Muted.copy(alpha = .42f); selected -> Amber; else -> TextPrimary }, modifier = Modifier.size(20.dp))
+        Icon(icon, null, tint = when { !enabled -> Muted.copy(alpha = .42f); selected -> Accent; else -> TextPrimary }, modifier = Modifier.size(20.dp))
     }
 }
 
@@ -706,7 +724,7 @@ fun PhotoToolApp(state: AppState, callbacks: AppCallbacks, modifier: Modifier = 
     Surface(modifier.fillMaxSize().semantics { contentDescription = "Aplicativo PhotoTool" }, color = Ink) {
         Column(Modifier.fillMaxSize()) {
         state.remote?.let { RemoteRecoveryNotice(it, callbacks) }
-        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().background(Brush.verticalGradient(listOf(Panel.copy(alpha = .34f), Ink, Stage)))) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().aeroAtmosphere()) {
             val appWidth = maxWidth
             val appHeight = maxHeight
             val phonePortrait = appWidth < 600.dp
@@ -724,7 +742,7 @@ fun PhotoToolApp(state: AppState, callbacks: AppCallbacks, modifier: Modifier = 
             if (phonePortrait && state.screen == Screen.GALLERY && state.filtersOpen) {
                 val modalInteraction = remember { MutableInteractionSource() }
                 Box(
-                    Modifier.matchParentSize().background(Color.Black.copy(alpha = .76f))
+                    Modifier.matchParentSize().background(Brush.radialGradient(listOf(Color(0x8c060e1a), Color(0xdb03070d))))
                         .clickable(interactionSource = modalInteraction, indication = null) {}
                         .semantics { contentDescription = "Filtros modais abertos" },
                 ) {
@@ -742,7 +760,7 @@ private fun RemoteRecoveryNotice(remote: RemoteBrowseState, callbacks: AppCallba
     val message = remote.error
         ?: remote.editorialNotice?.takeIf { remote.editorialNeedsRefresh }
         ?: if (remote.projection == "DEGRADED") "Snapshot degradado. Edição indisponível." else return
-    Row(Modifier.fillMaxWidth().background(Panel).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().aeroFill(FlatShape, Aero.panel, rim = null).aeroEdgeLine(bottom = true).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(
             message,
             color = Danger,
@@ -755,9 +773,9 @@ private fun RemoteRecoveryNotice(remote: RemoteBrowseState, callbacks: AppCallba
 
 @Composable
 private fun RemotePagination(remote: RemoteBrowseState, callbacks: AppCallbacks) {
-    Row(Modifier.fillMaxWidth().background(Panel).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+    Row(Modifier.fillMaxWidth().aeroFill(FlatShape, Aero.panel, rim = null).aeroEdgeLine(top = true).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         AppIconButton(ChevronLeft, "Página anterior", { callbacks.changePage(-1) }, enabled = !remote.loading && remote.page > 1)
-        Text("Página ${remote.page} de ${remote.totalPages}", style = ProofAnnotationStyle, color = Muted)
+        Text("Página ${remote.page} de ${remote.totalPages}", style = MaterialTheme.typography.labelMedium, color = Muted)
         AppIconButton(ChevronRight, "Próxima página", { callbacks.changePage(1) }, enabled = !remote.loading && remote.page < remote.totalPages)
     }
 }
@@ -798,7 +816,7 @@ private fun CompactNavigationBar(state: AppState, callbacks: AppCallbacks) {
     // Keep the same menu items in-root on web, avoiding a transient accessibility owner.
     if (state.remote != null && moreOpen) Column(Modifier.fillMaxWidth().background(Raised)) { menuEntries() }
     Row(
-        Modifier.fillMaxWidth().height(64.dp).background(Panel).border(1.dp, Hairline),
+        Modifier.fillMaxWidth().height(60.dp).aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(top = true),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         listOf(
@@ -839,7 +857,7 @@ private fun RailIconButton(icon: ImageVector, description: String, onClick: () -
 
 @Composable
 private fun LibraryRail(state: AppState, callbacks: AppCallbacks) = BoxWithConstraints(
-    Modifier.fillMaxHeight().width(58.dp).background(Panel).border(width = 1.dp, color = Hairline.copy(alpha = .55f)),
+    Modifier.fillMaxHeight().width(58.dp).aeroFill(FlatShape, Aero.panel, rim = null).aeroEdgeLine(end = true),
 ) {
     val compact = maxHeight < 520.dp
     val railScroll = rememberScrollState()
@@ -849,13 +867,13 @@ private fun LibraryRail(state: AppState, callbacks: AppCallbacks) = BoxWithConst
     }
     val railModifier = if (compact) Modifier.fillMaxSize().verticalScroll(railScroll) else Modifier.fillMaxSize()
     Column(
-        railModifier.padding(start = 6.dp, end = 6.dp, top = 8.dp, bottom = 14.dp),
+        railModifier.padding(start = 6.dp, end = 6.dp, top = 10.dp, bottom = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
             PhotoToolMark(Modifier.size(29.dp))
         }
-        Spacer(Modifier.height(if (compact) 5.dp else 16.dp))
+        Spacer(Modifier.height(if (compact) 6.dp else 18.dp))
         val entries = listOf(
             Triple(LibrarySection.ALL_PHOTOS, PhotoLibrary, "Todas as fotos"),
             Triple(LibrarySection.CALENDAR, CalendarMonth, "Calendário"),
@@ -866,42 +884,43 @@ private fun LibraryRail(state: AppState, callbacks: AppCallbacks) = BoxWithConst
         entries.forEach { (section, icon, label) ->
             val active = state.section == section && state.screen != Screen.SETTINGS
             RailIconButton(icon, label, { callbacks.dispatch(Action.Navigate(section)) }, selected = active, enabled = callbacks.capabilities.supports(section), tooltipEnabled = state.remote == null)
-            Spacer(Modifier.height(if (compact) 1.dp else 3.dp))
+            Spacer(Modifier.height(if (compact) 2.dp else 4.dp))
         }
-        if (compact) Spacer(Modifier.height(5.dp)) else Spacer(Modifier.weight(1f))
+        if (compact) Spacer(Modifier.height(6.dp)) else Spacer(Modifier.weight(1f))
         RailIconButton(HelpOutline, "Ajuda de atalhos", { callbacks.dispatch(Action.ToggleHelp) }, tooltipEnabled = state.remote == null)
-        Spacer(Modifier.height(if (compact) 1.dp else 3.dp))
+        Spacer(Modifier.height(if (compact) 2.dp else 4.dp))
         RailIconButton(Settings, "Configurações", { callbacks.dispatch(Action.OpenSettings) }, selected = state.screen == Screen.SETTINGS, tooltipEnabled = state.remote == null)
         Box(
-            Modifier.padding(top = if (compact) 4.dp else 8.dp).size(8.dp).background(if (state.writeEnabled) PickGreen else Muted, RoundedCornerShape(4.dp))
+            Modifier.padding(top = if (compact) 4.dp else 10.dp).size(8.dp).background(if (state.writeEnabled) Mint else Caution, RoundedCornerShape(4.dp))
                 .semantics { contentDescription = if (state.writeEnabled) "Edição XMP ativada" else "Somente leitura" },
         )
     }
 }
 
 @Composable
-private fun LibraryToolbar(state: AppState, callbacks: AppCallbacks, searchFocusChanged: (Boolean) -> Unit) = Column(Modifier.fillMaxWidth().background(Panel)) {
+private fun LibraryToolbar(state: AppState, callbacks: AppCallbacks, searchFocusChanged: (Boolean) -> Unit) = Column(Modifier.fillMaxWidth().aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(bottom = true)) {
     if (state.screen != Screen.GALLERY) {
-        Row(Modifier.fillMaxWidth().height(62.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(if (state.screen == Screen.CALENDAR) "Calendário" else "Pastas", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.width(12.dp))
-            Text(photoCount(state.totalPhotoCount), color = Muted, style = ProofAnnotationStyle)
+            Text(photoCount(state.totalPhotoCount), color = Muted, style = MaterialTheme.typography.labelMedium)
         }
         return@Column
     }
     BoxWithConstraints(Modifier.fillMaxWidth()) {
         val toolbarWidth = maxWidth
         val narrow = toolbarWidth < 700.dp
-        if (narrow) Column(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 5.dp)) {
+        if (narrow) Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             GallerySearch(state, callbacks, Modifier.fillMaxWidth(), searchFocusChanged)
             GalleryToolbarControls(state, callbacks, Modifier.fillMaxWidth(), compact = true, showSummary = true)
-        } else Row(Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.widthIn(min = 126.dp, max = 154.dp)) {
+        } else Row(Modifier.fillMaxWidth().height(68.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.widthIn(min = 126.dp, max = 154.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(sectionTitle(state.section), fontWeight = FontWeight.SemiBold, maxLines = 1)
-                Text(photoCount(state.visiblePhotoCount), color = Muted, style = ProofAnnotationStyle)
+                Text(photoCount(state.visiblePhotoCount), color = Muted, style = MaterialTheme.typography.labelMedium)
             }
-            Spacer(Modifier.width(10.dp))
-            GallerySearch(state, callbacks, Modifier.widthIn(min = 180.dp, max = 420.dp).weight(1f), searchFocusChanged)
+            Spacer(Modifier.width(12.dp))
+            GallerySearch(state, callbacks, Modifier.weight(1f).widthIn(min = 220.dp), searchFocusChanged)
+            Spacer(Modifier.width(16.dp))
             GalleryToolbarControls(state, callbacks, compact = toolbarWidth < 900.dp)
         }
     }
@@ -923,11 +942,6 @@ private fun ProofTextField(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val focused by interaction.collectIsFocusedAsState()
-    val borderColor = when {
-        !enabled -> Hairline.copy(alpha = .42f)
-        focused -> Amber
-        else -> Hairline.copy(alpha = .78f)
-    }
     val textColor = if (enabled) TextPrimary else Muted.copy(alpha = .55f)
     BasicTextField(
         value = value,
@@ -937,26 +951,25 @@ private fun ProofTextField(
         interactionSource = interaction,
         keyboardOptions = keyboardOptions,
         keyboardActions = keyboardActions,
-        cursorBrush = SolidColor(Amber),
-        textStyle = MaterialTheme.typography.bodyMedium.copy(color = textColor, fontFamily = FontFamily.Monospace, letterSpacing = .15.sp),
-        modifier = modifier.height(56.dp).clip(RoundedCornerShape(2.dp))
-            .background(if (focused) ProofPaper else Stage)
-            .border(if (focused) 1.5.dp else 1.dp, borderColor, RoundedCornerShape(2.dp))
+        cursorBrush = SolidColor(Accent),
+        textStyle = MaterialTheme.typography.bodyMedium.copy(color = textColor),
+        modifier = modifier.height(56.dp)
+            .aeroSurface(CompactShape, if (focused) Aero.card else Aero.well, rim = if (focused) Aero.accentRim else Aero.wellRim, rimWidth = if (focused) 1.5.dp else 1.dp)
             .onFocusChanged { focusChanged(it.isFocused) },
         decorationBox = { innerField ->
             Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.width(if (focused) 3.dp else 2.dp).fillMaxHeight().background(if (focused) Amber else Hairline.copy(alpha = .52f)))
+                Box(Modifier.width(if (focused) 3.dp else 2.dp).fillMaxHeight().background(if (focused) Accent else Hairline.copy(alpha = .52f)))
                 leadingIcon?.let { icon ->
-                    Box(Modifier.width(40.dp).fillMaxHeight(), contentAlignment = Alignment.Center) {
-                        Icon(icon, null, tint = if (focused) Amber else Muted, modifier = Modifier.size(18.dp))
+                    Box(Modifier.width(38.dp).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                        Icon(icon, null, tint = if (focused) Accent else Muted, modifier = Modifier.size(18.dp))
                     }
                 }
                 Column(
-                    Modifier.weight(1f).fillMaxHeight().padding(start = if (leadingIcon == null) 12.dp else 2.dp, end = 12.dp, top = 6.dp, bottom = 5.dp),
+                    Modifier.weight(1f).fillMaxHeight().padding(start = if (leadingIcon == null) 14.dp else 4.dp, end = 14.dp, top = 6.dp, bottom = 6.dp),
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    Text(label, color = if (focused) Amber else Muted, style = ProofAnnotationStyle.copy(fontSize = 11.sp, lineHeight = 12.sp, letterSpacing = .55.sp), maxLines = 1)
-                    Box(Modifier.fillMaxWidth().heightIn(min = 20.dp), contentAlignment = Alignment.CenterStart) {
+                    Text(label, color = if (focused) Accent else Muted, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                    Box(Modifier.fillMaxWidth().heightIn(min = 18.dp), contentAlignment = Alignment.CenterStart) {
                         if (value.isEmpty()) Text(placeholder, color = Muted.copy(alpha = if (enabled) .72f else .42f), style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         innerField()
                     }
@@ -984,26 +997,26 @@ private fun GallerySearch(state: AppState, callbacks: AppCallbacks, modifier: Mo
 
 @Composable
 private fun GalleryToolbarControls(state: AppState, callbacks: AppCallbacks, modifier: Modifier = Modifier, compact: Boolean, showSummary: Boolean = false) {
-    Row(modifier.height(if (showSummary) 52.dp else 46.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
+    Row(modifier.height(if (showSummary) 52.dp else 44.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.End) {
         if (showSummary) Column(Modifier.weight(1f).padding(start = 4.dp)) {
             Text(sectionTitle(state.section), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge, maxLines = 1)
-            Text(photoCount(state.visiblePhotoCount), color = Muted, style = ProofAnnotationStyle)
+            Text(photoCount(state.visiblePhotoCount), color = Muted, style = MaterialTheme.typography.labelMedium)
         }
         OutlinedButton(
             onClick = { callbacks.dispatch(Action.ToggleFilters) },
             shape = CompactShape,
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = if (state.filtersOpen) Amber else TextPrimary),
-            border = BorderStroke(1.dp, if (state.filtersOpen) Amber else Hairline),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = if (state.filtersOpen) Accent else TextPrimary),
+            border = BorderStroke(1.dp, if (state.filtersOpen) Accent else Hairline),
             contentPadding = PaddingValues(horizontal = if (compact) 12.dp else 15.dp),
             modifier = Modifier.heightIn(min = 44.dp).semantics { contentDescription = "Filtros" },
         ) {
             Icon(Tune, null, Modifier.size(18.dp)); if (!compact) { Spacer(Modifier.width(7.dp)); Text("Filtros") }
         }
-        Spacer(Modifier.width(5.dp))
+        Spacer(Modifier.width(8.dp))
         if (!state.selectionModeActive) AppIconButton(SelectAll, "Selecionar fotografias", { callbacks.dispatch(Action.ToggleSelectionMode) })
-        if (!compact) Column(Modifier.padding(horizontal = 8.dp), horizontalAlignment = Alignment.End) {
-            Text("ORDEM", color = Amber, style = ProofAnnotationStyle)
-            Text(if (state.query.sort == PhotoSort.CAPTURE_TIME) "CAPTURA" else "ADIÇÃO", color = Muted, style = ProofAnnotationStyle)
+        if (!compact) Column(Modifier.padding(horizontal = 12.dp), horizontalAlignment = Alignment.End) {
+            Text("ORDEM", color = Accent, style = MaterialTheme.typography.labelMedium)
+            Text(if (state.query.sort == PhotoSort.CAPTURE_TIME) "CAPTURA" else "ADIÇÃO", color = Muted, style = MaterialTheme.typography.labelMedium)
         }
         AppIconButton(Remove, "Miniaturas menores", { callbacks.dispatch(Action.SetThumbnailSize(state.thumbnailSize - 20)) })
         AppIconButton(Add, "Miniaturas maiores", { callbacks.dispatch(Action.SetThumbnailSize(state.thumbnailSize + 20)) })
@@ -1043,7 +1056,7 @@ private fun ActiveFilters(state: AppState, callbacks: AppCallbacks) {
         if (state.query.gps != GpsFilter.ANY) add("GPS: ${if (state.query.gps == GpsFilter.PRESENT) "presente" else "ausente"}" to { copy(gps = GpsFilter.ANY) })
     }
     if (chips.isEmpty()) return
-    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+    FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         chips.forEach { (label, transform) -> InputChip(
             selected = true,
             shape = RoundedCornerShape(2.dp),
@@ -1109,7 +1122,7 @@ private fun GalleryBody(state: AppState, callbacks: AppCallbacks, searchFocused:
 
 @Composable
 private fun BatchCommandBar(state: AppState, callbacks: AppCallbacks) = BoxWithConstraints(
-    Modifier.fillMaxWidth().background(Raised).semantics { contentDescription = "Batch command bar" },
+    Modifier.fillMaxWidth().aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(bottom = true).semantics { contentDescription = "Batch command bar" },
 ) {
     var keyword by remember { mutableStateOf("") }
     var keywordError by remember { mutableStateOf<String?>(null) }
@@ -1164,13 +1177,13 @@ private fun BatchCommandBar(state: AppState, callbacks: AppCallbacks) = BoxWithC
         )
     }
     Column(
-        Modifier.fillMaxWidth().heightIn(max = (maxHeight * .78f).coerceAtLeast(220.dp)).verticalScroll(rememberScrollState()).padding(horizontal = 10.dp, vertical = 6.dp),
+        Modifier.fillMaxWidth().heightIn(max = (maxHeight * .78f).coerceAtLeast(220.dp)).verticalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Row(Modifier.fillMaxWidth().heightIn(min = 44.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (selectionLimitReached) "${selected.size} de $visibleCount selecionadas · limite seguro de $MAX_BATCH_PHOTOS atingido" else selectedPhotoCount(selected.size),
-                color = Amber, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
+                color = Accent, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
             )
             AppIconButton(SelectAll, "Selecionar todas as fotografias visíveis", { callbacks.dispatch(Action.SelectVisible) })
             AppIconButton(Clear, "Limpar seleção", { callbacks.dispatch(Action.ClearSelection) })
@@ -1181,7 +1194,7 @@ private fun BatchCommandBar(state: AppState, callbacks: AppCallbacks) = BoxWithC
                 enabled = canMutate,
                 onClick = { requestEditorial(BatchEdit.SetFlag(Flag.PICK)) },
                 shape = CompactShape,
-                colors = ButtonDefaults.textButtonColors(contentColor = PickGreen),
+                colors = ButtonDefaults.textButtonColors(contentColor = Mint),
                 modifier = Modifier.height(44.dp),
             ) { Icon(PickFlag, null, Modifier.size(17.dp)); Spacer(Modifier.width(5.dp)); Text("Escolher") }
             BatchChoiceMenu("Flag", listOf("Sem flag", "Rejeitar"), canMutate) { choice -> requestEditorial(BatchEdit.SetFlag(if (choice == "Rejeitar") Flag.REJECT else Flag.UNFLAGGED)) }
@@ -1212,7 +1225,7 @@ private fun BatchCommandBar(state: AppState, callbacks: AppCallbacks) = BoxWithC
         keywordError?.let { Text(it, color = Danger, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 6.dp)) }
         editorialNotice?.let { Text(it, color = Muted, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 6.dp).semantics { contentDescription = "Resultado solicitado do lote editorial" }) }
         auxiliaryResult?.let { result ->
-            Text(result.summary, color = if (result.failed > 0) Danger else PickGreen, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 6.dp).semantics { contentDescription = "Resultado do lote ${result.channel}" })
+            Text(result.summary, color = if (result.failed > 0) Danger else Mint, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 6.dp).semantics { contentDescription = "Resultado do lote ${result.channel}" })
             val names = state.photos.associateBy({ it.id }, { it.displayName })
             result.items.take(MAX_SENSITIVE_BATCH_PHOTOS).forEach { item ->
                 val outcome = when (item.outcome) {
@@ -1266,7 +1279,7 @@ private fun BatchRecipePanel(
     submit: (AuxiliaryBatchEdit) -> Unit,
 ) {
     Column(
-        Modifier.fillMaxWidth().clip(CompactShape).background(Stage).border(1.dp, Hairline, CompactShape).padding(10.dp)
+        Modifier.fillMaxWidth().aeroSurface(CompactShape, Aero.panel).padding(14.dp)
             .semantics { contentDescription = "Controles Fuji e HDR em lote" },
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -1293,7 +1306,7 @@ private fun BatchRecipePanel(
                 BatchNumberControl(batchHdrLabel(name), hdrControls[name] ?: 0, -100, 100, enabled) { changeControl(name, it) }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = { submit(AuxiliaryBatchEdit.SetHdr(true, "$hdrMaximum.00", hdrControls)) },
                 shape = CompactShape,
@@ -1313,7 +1326,7 @@ private fun BatchRecipePanel(
 @Composable
 private fun BatchNumberControl(label: String, value: Int, minimum: Int, maximum: Int, enabled: Boolean, changed: (Int) -> Unit) {
     Row(
-        Modifier.width(210.dp).heightIn(min = 44.dp).clip(CompactShape).background(Raised).padding(start = 9.dp),
+        Modifier.width(216.dp).heightIn(min = 44.dp).aeroFill(CompactShape, Aero.well, Aero.wellRim).padding(start = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text("$label  $value", style = MaterialTheme.typography.labelSmall, modifier = Modifier.weight(1f))
@@ -1353,7 +1366,7 @@ private fun CalendarScreen(state: AppState, callbacks: AppCallbacks) {
     var selectedYear by remember(state.photos) { mutableStateOf<String?>(null) }
     var selectedMonth by remember(state.photos) { mutableStateOf<String?>(null) }
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             if (selectedMonth != null) TextButton(onClick = { selectedMonth = null }, shape = CompactShape, modifier = Modifier.height(44.dp).semantics { contentDescription = "Voltar para meses de $selectedYear" }) { Icon(ArrowBack, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Meses de $selectedYear") }
             else if (selectedYear != null) TextButton(onClick = { selectedYear = null }, shape = CompactShape, modifier = Modifier.height(44.dp).semantics { contentDescription = "Voltar para todos os anos" }) { Icon(ArrowBack, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Todos os anos") }
             else Text("Data de captura", color = Muted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(horizontal = 8.dp))
@@ -1395,13 +1408,13 @@ private fun monthName(month: Int) = listOf("Janeiro", "Fevereiro", "Março", "Ab
 @Composable
 private fun CalendarCoverCard(title: String, count: String, representative: Photo, callbacks: AppCallbacks, description: String, clicked: () -> Unit) {
     Box(
-        Modifier.fillMaxWidth().aspectRatio(1.35f).background(Raised).clickable(onClick = clicked).semantics { contentDescription = description },
+        Modifier.fillMaxWidth().aspectRatio(1.35f).aeroFill(CompactShape, Aero.card, rim = null).clickable(onClick = clicked).semantics { contentDescription = description },
     ) {
         PhotoImage(representative, callbacks, 720, ContentScale.Crop, Modifier.fillMaxSize())
         Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x22000000), Color(0xdd08090a)), startY = 80f)))
         Column(Modifier.align(Alignment.BottomStart).padding(14.dp)) {
             Text(title, color = Color.White, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
-            Text(count.uppercase(), color = Color(0xffdedfe1), style = ProofAnnotationStyle)
+            Text(count.uppercase(), color = Color(0xffdedfe1), style = MaterialTheme.typography.labelMedium)
         }
     }
 }
@@ -1410,9 +1423,9 @@ private fun CalendarCoverCard(title: String, count: String, representative: Phot
 private fun FoldersScreen(state: AppState, callbacks: AppCallbacks) {
     val roots = state.photos.filter { it.folder.isNotBlank() }.groupBy { it.folder.substringBefore('/') }.toList().sortedBy { it.first }
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().height(54.dp).padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.fillMaxWidth().height(56.dp).padding(horizontal = 20.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(state.library ?: "Biblioteca", color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            Text("${roots.size} ${if (roots.size == 1) "PASTA" else "PASTAS"}", color = Muted, style = ProofAnnotationStyle)
+            Text("${roots.size} ${if (roots.size == 1) "PASTA" else "PASTAS"}", color = Muted, style = MaterialTheme.typography.labelMedium)
         }
         if (roots.isEmpty()) EmptyGallery(state, callbacks) else LazyVerticalGrid(
             columns = GridCells.Adaptive(210.dp),
@@ -1439,17 +1452,17 @@ private fun FolderCoverCard(folder: String, photos: List<Photo>, callbacks: AppC
     }
     val nested = photos.map { it.folder }.distinct().count { it != folder }
     Column(
-        Modifier.fillMaxWidth().background(ProofPaper).border(1.dp, Hairline.copy(alpha = .5f)).clickable(onClick = clicked).semantics { contentDescription = "Navegar pela pasta $folder, ${photoCount(photos.size)}, intervalo $dateRange" },
+        Modifier.fillMaxWidth().aeroFill(CompactShape, Aero.card).clickable(onClick = clicked).semantics { contentDescription = "Navegar pela pasta $folder, ${photoCount(photos.size)}, intervalo $dateRange" },
     ) {
         Box(Modifier.fillMaxWidth().aspectRatio(1.5f)) {
             PhotoImage(representative, callbacks, 720, ContentScale.Crop, Modifier.fillMaxSize())
             Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color(0x66080503)), startY = 100f)))
         }
-        Column(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-            Text(photoCount(photos.size).uppercase(), color = Amber, style = ProofAnnotationStyle)
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+            Text(photoCount(photos.size).uppercase(), color = Accent, style = MaterialTheme.typography.labelMedium)
             Text(folder, color = TextPrimary, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(dateRange, color = Muted, style = ProofAnnotationStyle, maxLines = 1)
-            if (nested > 0) Text("$nested ${if (nested == 1) "CAMINHO INTERNO" else "CAMINHOS INTERNOS"}", color = Muted, style = ProofAnnotationStyle, maxLines = 1)
+            Text(dateRange, color = Muted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+            if (nested > 0) Text("$nested ${if (nested == 1) "CAMINHO INTERNO" else "CAMINHOS INTERNOS"}", color = Muted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
         }
     }
 }
@@ -1483,12 +1496,12 @@ private fun FilterRail(state: AppState, callbacks: AppCallbacks, modifier: Modif
     var mode by remember { mutableStateOf(FilterMode.EDITORIAL) }
     val dateError = queryDateError(state.query.fromDate, state.query.toDate)
     Column(
-        modifier.clip(RoundedCornerShape(2.dp)).background(Inspector.copy(alpha = .99f)).border(1.dp, Hairline, RoundedCornerShape(2.dp))
-            .verticalScroll(rememberScrollState()).padding(16.dp).semantics { contentDescription = "Painel de filtros" },
-        verticalArrangement = Arrangement.spacedBy(13.dp),
+        modifier.aeroSurface(RoundedCornerShape(10.dp), Aero.panel)
+            .verticalScroll(rememberScrollState()).padding(18.dp).semantics { contentDescription = "Painel de filtros" },
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(Tune, null, tint = Amber, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(9.dp))
+            Icon(Tune, null, tint = Accent, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(9.dp))
             Column(Modifier.weight(1f)) { Text("Filtros", fontWeight = FontWeight.SemiBold); Text("Refinar catálogo", color = Muted, style = MaterialTheme.typography.bodySmall) }
             AppIconButton(Close, "Fechar filtros sem aplicar", { callbacks.dispatch(Action.ToggleFilters) })
         }
@@ -1501,7 +1514,7 @@ private fun FilterRail(state: AppState, callbacks: AppCallbacks, modifier: Modif
         when (mode) {
             FilterMode.EDITORIAL -> {
                 Text("Estado editorial", color = Muted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(
                         Triple<Flag?, String, ImageVector>(null, "Todos", PhotoLibrary),
                         Triple(Flag.PICK, "Escolhida", PickFlag),
@@ -1514,11 +1527,11 @@ private fun FilterRail(state: AppState, callbacks: AppCallbacks, modifier: Modif
             }
             FilterMode.STARS -> {
                 Text("Estrelas mínimas", color = Muted, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     (0..5).forEach { rating -> FilterChoice(state.query.minimumStars == rating, if (rating == 0) "Qualquer" else "$rating+", if (rating == 0) StarBorder else Star) { callbacks.dispatch(Action.SetQuery(state.query.copy(minimumStars = rating))) } }
                 }
             }
-            FilterMode.GPS -> FlowRow(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+            FilterMode.GPS -> FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 GpsFilter.entries.forEach { gps -> FilterChoice(state.query.gps == gps, when (gps) { GpsFilter.ANY -> "Qualquer"; GpsFilter.PRESENT -> "Com GPS"; GpsFilter.MISSING -> "Sem GPS" }, LocationOn) { callbacks.dispatch(Action.SetQuery(state.query.copy(gps = gps))) } }
             }
             FilterMode.KEYWORDS -> FilterField("Palavra-chave exata", state.query.keyword.orEmpty(), callbacks, icon = Tag) { callbacks.dispatch(Action.SetQuery(state.query.copy(keyword = it.ifBlank { null }))) }
@@ -1559,17 +1572,24 @@ private fun FilterChoice(selected: Boolean, label: String, icon: ImageVector, mo
     Box(
         modifier.heightIn(min = 44.dp).clip(RoundedCornerShape(2.dp))
             .onFocusChanged { focused = it.isFocused }
-            .background(when { selected -> AmberWash; pressed -> RaisedHover; hovered -> Raised; else -> Color.Transparent })
-            .then(if (focused) Modifier.border(2.dp, Focus, RoundedCornerShape(2.dp)) else Modifier)
+            .then(
+                when {
+                    selected -> Modifier.background(AccentWash).aeroRim(RoundedCornerShape(6.dp), Aero.accentRim)
+                    pressed -> Modifier.background(RaisedHover)
+                    hovered -> Modifier.background(Aero.card).aeroRim(RoundedCornerShape(6.dp))
+                    else -> Modifier
+                },
+            )
+            .then(if (focused) Modifier.border(2.dp, Focus, RoundedCornerShape(6.dp)) else Modifier)
             .hoverable(interaction)
             .clickable(interactionSource = interaction, indication = null, onClick = clicked)
             .semantics { contentDescription = label; this.selected = selected },
     ) {
-        Row(Modifier.align(Alignment.Center).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            Icon(icon, null, tint = if (selected) Amber else Muted, modifier = Modifier.size(17.dp))
-            Text(label, color = if (selected) Amber else TextPrimary, style = MaterialTheme.typography.labelLarge)
+        Row(Modifier.align(Alignment.Center).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Icon(icon, null, tint = if (selected) Accent else Muted, modifier = Modifier.size(17.dp))
+            Text(label, color = if (selected) Accent else TextPrimary, style = MaterialTheme.typography.labelLarge)
         }
-        if (selected) Canvas(Modifier.matchParentSize()) { drawLine(Amber, Offset(0f, size.height - 1.dp.toPx()), Offset(size.width, size.height - 1.dp.toPx()), strokeWidth = 2.dp.toPx()) }
+        if (selected) Canvas(Modifier.matchParentSize()) { drawLine(Accent, Offset(0f, size.height - 1.dp.toPx()), Offset(size.width, size.height - 1.dp.toPx()), strokeWidth = 2.dp.toPx()) }
     }
 }
 
@@ -1592,7 +1612,7 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
         val visible = state.visiblePhotos
         val compactTouchLayout = maxWidth < 600.dp
         val tileSize = state.thumbnailSize.dp
-        val columns = maxOf(1, ((maxWidth - 4.dp) / tileSize).toInt())
+        val columns = maxOf(1, ((maxWidth - 14.dp) / tileSize).toInt())
         val gridState = rememberLazyStaggeredGridState()
         val focusRequesters = remember { mutableStateMapOf<String, FocusRequester>() }
         val navigationScope = rememberCoroutineScope()
@@ -1672,7 +1692,7 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
             }
             return true
         }
-        LazyVerticalStaggeredGrid(columns = StaggeredGridCells.Adaptive(tileSize), state = gridState, contentPadding = PaddingValues(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalItemSpacing = 4.dp,
+        LazyVerticalStaggeredGrid(columns = StaggeredGridCells.Adaptive(tileSize), state = gridState, contentPadding = PaddingValues(4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalItemSpacing = 6.dp,
             modifier = Modifier.fillMaxSize().onPreviewKeyEvent galleryKeys@{ event ->
                 if (event.type == KeyEventType.KeyDown && event.key == Key.Escape && quickEditorId != null) { closeQuickEditor(); return@galleryKeys true }
                 if (event.type != KeyEventType.KeyDown || event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return@galleryKeys false
@@ -1709,9 +1729,9 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
                     }
                     .onFocusChanged { focused = it.isFocused; cardHasFocus = it.hasFocus; callbacks.shortcutScopeFocused(it.hasFocus) }
                     .hoverable(hoverInteraction)
-                    .clip(RoundedCornerShape(1.dp))
-                    .then(if (focused) Modifier.border(2.dp, Focus, RoundedCornerShape(1.dp)) else Modifier)
-                    .background(ProofPaper).clickable {
+                    .aeroSurface(CardShape, Aero.card, rim = if (selected) Aero.accentRim else Aero.rim)
+                    .then(if (focused) Modifier.border(2.dp, Focus, CardShape) else Modifier)
+                    .clickable {
                         if (state.selectionModeActive) callbacks.dispatch(Action.Select(photo.id, SelectionMode.TOGGLE))
                         else { callbacks.dispatch(Action.Select(photo.id)); callbacks.dispatch(Action.OpenDetail) }
                     }.semantics { contentDescription = "Fotografia ${photo.displayName}"; stateDescription = "Formato ${photo.mediaFormatLabel}"; this.selected = selected },
@@ -1724,7 +1744,7 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
                             .alpha(if (photo.editorial.flag == Flag.REJECT) .34f else 1f),
                         issueClicked = { issuePhotoId = photo.id },
                     )
-                    if (selected) ProofSelectionCorners(Amber, Modifier.matchParentSize())
+                    if (selected) ProofSelectionCorners(Accent, Modifier.matchParentSize())
                     if (quickOpen) {
                         Box(
                             Modifier.matchParentSize().background(Stage.copy(alpha = .74f)).clickable { closeQuickEditor() }
@@ -1736,8 +1756,8 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
                     }
                     if (state.selectionModeActive) {
                         Box(
-                            Modifier.align(Alignment.TopStart).padding(7.dp).size(28.dp).clip(RoundedCornerShape(2.dp))
-                                .background(if (selected) Amber else Stage.copy(alpha = .84f)).border(1.dp, if (selected) Amber else TextPrimary, RoundedCornerShape(2.dp)),
+                            Modifier.align(Alignment.TopStart).padding(8.dp).size(28.dp).clip(RoundedCornerShape(2.dp))
+                                .background(if (selected) Accent else Stage.copy(alpha = .84f)).border(1.dp, if (selected) Accent else TextPrimary, RoundedCornerShape(2.dp)),
                             contentAlignment = Alignment.Center,
                         ) { Icon(if (selected) Check else CheckBoxOutlineBlank, null, tint = if (selected) Ink else TextPrimary, modifier = Modifier.size(17.dp)) }
                     }
@@ -1746,13 +1766,13 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
                             Tune,
                             "Abrir curadoria rápida de ${photo.displayName}",
                             { quickEditorId = photo.id },
-                            Modifier.align(Alignment.TopEnd).padding(6.dp),
+                            Modifier.align(Alignment.TopEnd).padding(8.dp),
                         )
                     }
                     if (photo.writeState != WriteState.IDLE) {
                         val status = when (photo.writeState) { WriteState.SAVING -> "Salvando"; WriteState.PERSISTED -> "Salvo"; WriteState.FAILED -> "Falha"; WriteState.IDLE -> "" }
-                        Row(Modifier.align(Alignment.TopCenter).padding(8.dp).clip(CompactShape).background(Color(0xcc000000)).padding(horizontal = 7.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(if (photo.writeState == WriteState.FAILED) Close else Check, null, tint = if (photo.writeState == WriteState.FAILED) Danger else PickGreen, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text(status, color = TextPrimary, style = MaterialTheme.typography.labelSmall)
+                        Row(Modifier.align(Alignment.TopCenter).padding(10.dp).clip(CompactShape).background(Color(0xcc000000)).padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(if (photo.writeState == WriteState.FAILED) Close else Check, null, tint = if (photo.writeState == WriteState.FAILED) Danger else Mint, modifier = Modifier.size(14.dp)); Spacer(Modifier.width(4.dp)); Text(status, color = TextPrimary, style = MaterialTheme.typography.labelSmall)
                         }
                     }
                 }
@@ -1764,7 +1784,7 @@ private fun PhotoGrid(state: AppState, callbacks: AppCallbacks, searchFocused: B
             state.photos.firstOrNull { it.id == id }?.let { photo ->
                 PhotoProblemPanel(
                     photo,
-                    Modifier.align(Alignment.TopCenter).padding(10.dp).widthIn(max = minOf(460.dp, maxWidth - 20.dp)),
+                    Modifier.align(Alignment.TopCenter).padding(12.dp).widthIn(max = minOf(460.dp, maxWidth - 24.dp)),
                     close = { issuePhotoId = null },
                     recover = { callbacks.dispatch(Action.OpenSettings) },
                 )
@@ -1790,27 +1810,27 @@ private fun ProofSelectionCorners(color: Color, modifier: Modifier = Modifier) =
 
 @Composable
 private fun ProofAnnotation(photo: Photo) = Row(
-    Modifier.fillMaxWidth().height(32.dp).background(ProofPaper).border(1.dp, Hairline.copy(alpha = .48f)).padding(horizontal = 7.dp),
+    Modifier.fillMaxWidth().height(34.dp).aeroFill(CompactShape, Aero.window, rim = null).aeroEdgeLine(top = true).padding(horizontal = 8.dp),
     verticalAlignment = Alignment.CenterVertically,
     horizontalArrangement = Arrangement.spacedBy(6.dp),
 ) {
-    Text(photo.filenameNumber ?: "S/N", color = Amber, style = ProofAnnotationStyle)
+    Text(photo.filenameNumber ?: "S/N", color = Accent, style = MaterialTheme.typography.labelMedium)
     if (photo.editorial.flag != Flag.UNFLAGGED) Icon(
         if (photo.editorial.flag == Flag.PICK) PickFlag else RejectFlag,
         null,
-        tint = if (photo.editorial.flag == Flag.PICK) PickGreen else Danger,
+        tint = if (photo.editorial.flag == Flag.PICK) Mint else Danger,
         modifier = Modifier.size(14.dp),
     )
     if (photo.editorial.rating > 0) {
-        Icon(Star, null, tint = Amber, modifier = Modifier.size(12.dp))
-        Text(photo.editorial.rating.toString(), color = TextPrimary, style = ProofAnnotationStyle)
+        Icon(Star, null, tint = Accent, modifier = Modifier.size(12.dp))
+        Text(photo.editorial.rating.toString(), color = TextPrimary, style = MaterialTheme.typography.labelMedium)
     }
     photo.editorial.label?.let { Box(Modifier.size(8.dp).background(labelColor(it), RoundedCornerShape(1.dp))) }
     Spacer(Modifier.weight(1f))
     Text(
         photo.mediaFormatLabel,
         color = Muted,
-        style = ProofAnnotationStyle,
+        style = MaterialTheme.typography.labelMedium,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
         modifier = Modifier.semantics { contentDescription = "Formato ${photo.mediaFormatLabel}" },
@@ -1898,7 +1918,7 @@ private fun PhotoImage(
             }
         }
         if (photo.issue != null || photo.writeError != null || photo.metadata.status == MetadataStatus.ERROR || photo.editorial.goodError != null) Box(
-            Modifier.align(Alignment.BottomEnd).padding(7.dp).size(44.dp).clip(RoundedCornerShape(22.dp)).background(Stage.copy(alpha = .82f))
+            Modifier.align(Alignment.BottomEnd).padding(8.dp).size(44.dp).clip(RoundedCornerShape(22.dp)).background(Stage.copy(alpha = .82f))
                 .border(1.dp, Danger.copy(alpha = .82f), RoundedCornerShape(22.dp))
                 .then(if (issueClicked != null) Modifier.clickable(onClick = issueClicked) else Modifier)
                 .semantics { contentDescription = "Exibir problema de ${photo.displayName}"; stateDescription = photoProblemText(photo) },
@@ -1922,9 +1942,9 @@ private fun PhotoProblemPanel(photo: Photo, modifier: Modifier = Modifier, close
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(photo.id) { focusRequester.requestFocus() }
     Column(
-        modifier.clip(RoundedCornerShape(7.dp)).background(Inspector).border(1.dp, Danger.copy(alpha = .72f), RoundedCornerShape(7.dp)).padding(12.dp)
+        modifier.aeroSurface(RoundedCornerShape(9.dp), Aero.panel, rim = null).border(1.dp, Danger.copy(alpha = .72f), RoundedCornerShape(9.dp)).padding(14.dp)
             .semantics { contentDescription = "Problema da fotografia ${photo.displayName}" },
-        verticalArrangement = Arrangement.spacedBy(7.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(ErrorOutline, null, tint = Danger, modifier = Modifier.size(19.dp))
@@ -1938,8 +1958,8 @@ private fun PhotoProblemPanel(photo: Photo, modifier: Modifier = Modifier, close
         OutlinedButton(
             onClick = recover,
             shape = CompactShape,
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = Amber),
-            border = BorderStroke(1.dp, Amber.copy(alpha = .72f)),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+            border = BorderStroke(1.dp, Accent.copy(alpha = .72f)),
             modifier = Modifier.heightIn(min = 44.dp).semantics { contentDescription = "Ir às configurações para sincronizar" },
         ) {
             Icon(Settings, null, Modifier.size(17.dp)); Spacer(Modifier.width(6.dp)); Text("Ir às configurações")
@@ -2035,7 +2055,7 @@ private fun EditorialFlagSelector(flag: Flag, enabled: Boolean, modifier: Modifi
         enabled = enabled,
         description = "Estado editorial",
         itemDescription = { item -> when (item) { Flag.REJECT -> "Marcar como rejeitada"; Flag.UNFLAGGED -> "Remover flag"; Flag.PICK -> "Marcar como escolhida" } },
-        accent = { item -> when (item) { Flag.REJECT -> Danger; Flag.UNFLAGGED -> Muted; Flag.PICK -> PickGreen } },
+        accent = { item -> when (item) { Flag.REJECT -> Danger; Flag.UNFLAGGED -> Muted; Flag.PICK -> Mint } },
         modifier = modifier,
         onSelect = onSelect,
     ) { item, _ -> Icon(when (item) { Flag.REJECT -> RejectFlag; Flag.UNFLAGGED -> FlagIcon; Flag.PICK -> PickFlag }, null, Modifier.size(19.dp)) }
@@ -2071,7 +2091,7 @@ private fun EditorialRatingSlider(rating: Int, enabled: Boolean, description: St
                 Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
                     if (value == 0) Icon(Clear, null, tint = Muted, modifier = Modifier.size(12.dp))
                     else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(1.dp)) {
-                        Icon(Star, null, tint = if (value <= gestureValue.roundToInt()) Amber else Muted, modifier = Modifier.size(11.dp))
+                        Icon(Star, null, tint = if (value <= gestureValue.roundToInt()) Accent else Muted, modifier = Modifier.size(11.dp))
                         Text(value.toString(), color = if (value == gestureValue.roundToInt()) TextPrimary else Muted, style = MaterialTheme.typography.labelSmall)
                     }
                 }
@@ -2087,7 +2107,7 @@ private fun EditorialRatingSlider(rating: Int, enabled: Boolean, description: St
             valueRange = 0f..5f,
             steps = 4,
             enabled = enabled,
-            colors = SliderDefaults.colors(thumbColor = Amber, activeTrackColor = Amber, inactiveTrackColor = Hairline, activeTickColor = Ink, inactiveTickColor = Muted),
+            colors = SliderDefaults.colors(thumbColor = Accent, activeTrackColor = Accent, inactiveTrackColor = Hairline, activeTickColor = Ink, inactiveTickColor = Muted),
             modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).semantics { contentDescription = description; stateDescription = if (rating == 0) "Sem estrelas" else "$rating estrelas" },
         )
     }
@@ -2111,9 +2131,9 @@ private fun QuickEditor(photo: Photo, state: AppState, callbacks: AppCallbacks, 
     LaunchedEffect(photo.id) { closeFocusRequester.requestFocus() }
     Surface(
         modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Curadoria rápida de ${photo.displayName}" },
-        color = ProofPaper,
+        color = Sunken,
         shape = RoundedCornerShape(2.dp),
-        border = BorderStroke(1.dp, Amber.copy(alpha = .58f)),
+        border = BorderStroke(1.dp, Accent.copy(alpha = .58f)),
         shadowElevation = 8.dp,
     ) {
         Column(
@@ -2122,7 +2142,7 @@ private fun QuickEditor(photo: Photo, state: AppState, callbacks: AppCallbacks, 
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(photo.displayName, color = TextPrimary, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                Text(photo.mediaFormatLabel, color = Muted, style = ProofAnnotationStyle, maxLines = 1)
+                Text(photo.mediaFormatLabel, color = Muted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
                 AppIconButton(Close, "Fechar curadoria rápida", close, Modifier.focusRequester(closeFocusRequester))
             }
             if (state.remote != null) Text("Abra a fotografia para editar o XMP.", color = Muted, style = MaterialTheme.typography.bodySmall)
@@ -2133,7 +2153,7 @@ private fun QuickEditor(photo: Photo, state: AppState, callbacks: AppCallbacks, 
                 val failed = photo.writeState == WriteState.FAILED
                 val status = when (photo.writeState) { WriteState.SAVING -> "Salvando no XMP"; WriteState.PERSISTED -> "Salvo e verificado"; WriteState.FAILED -> "Falha ao salvar"; WriteState.IDLE -> "" }
                 Row(Modifier.fillMaxWidth().heightIn(min = 24.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(if (failed) Close else Check, null, tint = if (failed) Danger else PickGreen, modifier = Modifier.size(14.dp))
+                    Icon(if (failed) Close else Check, null, tint = if (failed) Danger else Mint, modifier = Modifier.size(14.dp))
                     Spacer(Modifier.width(5.dp)); Text(status, color = if (failed) Danger else Muted, style = MaterialTheme.typography.labelSmall)
                 }
             }
@@ -2326,7 +2346,7 @@ private fun CompactDetailPanel(
         val closeFocus = remember { FocusRequester() }
         LaunchedEffect(panel) { if (panel != null) closeFocus.requestFocus() }
         Row(
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp).heightIn(min = 58.dp),
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp).heightIn(min = 60.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(title, Modifier.weight(1f), fontWeight = FontWeight.SemiBold, fontSize = 17.sp)
@@ -2449,9 +2469,9 @@ private fun DetailImageArea(
         modifier.background(Stage).focusable().onFocusChanged { callbacks.shortcutScopeFocused(it.hasFocus) }.semantics { contentDescription = "Visualizador da fotografia" },
     ) {
         if (compact) {
-            Row(Modifier.fillMaxWidth().height(48.dp).background(Panel).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Row(Modifier.fillMaxWidth().height(52.dp).aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(bottom = true).padding(horizontal = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 AppIconButton(ArrowBack, "Voltar à biblioteca", { callbacks.dispatch(Action.CloseDetail) })
-                Text(photo.displayName, Modifier.weight(1f).padding(horizontal = 8.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
+                Text(photo.displayName, Modifier.weight(1f).padding(horizontal = 10.dp), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                 AppIconButton(PhotoLibrary, "Abrir miniaturas", openFilmstrip, enabled = state.visiblePhotos.size > 1)
                 AppIconButton(Tune, "Abrir curadoria e metadados", openInspector)
                 if (controlsInHeader) {
@@ -2463,11 +2483,11 @@ private fun DetailImageArea(
                     AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, enabled = nextAvailable)
                 }
             }
-        } else Box(Modifier.fillMaxWidth().height(58.dp).background(Panel)) {
-            AppIconButton(ArrowBack, "Voltar à biblioteca", { callbacks.dispatch(Action.CloseDetail) }, Modifier.align(Alignment.CenterStart).padding(start = 7.dp))
+        } else Box(Modifier.fillMaxWidth().height(60.dp).aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(bottom = true)) {
+            AppIconButton(ArrowBack, "Voltar à biblioteca", { callbacks.dispatch(Action.CloseDetail) }, Modifier.align(Alignment.CenterStart).padding(start = 8.dp))
             Column(Modifier.align(Alignment.Center).widthIn(max = 560.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(photo.displayName, maxLines = 1, overflow = TextOverflow.Ellipsis, color = TextPrimary, fontWeight = FontWeight.SemiBold)
-                Text(buildList { add(photo.mediaFormatLabel); photo.metadata.capturedAt?.let { add(formatCapturedAt(it, includeTime = false)) }; if (photo.folder.isNotBlank()) add(photo.folder) }.joinToString(" · "), color = Muted, style = ProofAnnotationStyle, maxLines = 1)
+                Text(buildList { add(photo.mediaFormatLabel); photo.metadata.capturedAt?.let { add(formatCapturedAt(it, includeTime = false)) }; if (photo.folder.isNotBlank()) add(photo.folder) }.joinToString(" · "), color = Muted, style = MaterialTheme.typography.labelMedium, maxLines = 1)
             }
         }
         Box(Modifier.weight(1f).fillMaxWidth().background(Color.Black)) {
@@ -2532,8 +2552,8 @@ private fun DetailImageArea(
                 filterQuality = detailFilterQuality(zoom, pixelZoom),
             )
             if (!compact) {
-                AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, Modifier.align(Alignment.CenterStart).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = previousAvailable)
-                AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, Modifier.align(Alignment.CenterEnd).padding(8.dp).background(Panel.copy(alpha = .78f), CompactShape), enabled = nextAvailable)
+                AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, Modifier.align(Alignment.CenterStart).padding(8.dp).aeroSurface(CompactShape, Aero.panel, Aero.rimStrong), enabled = previousAvailable)
+                AppIconButton(ChevronRight, "Próxima fotografia", { callbacks.navigate(1) }, Modifier.align(Alignment.CenterEnd).padding(8.dp).aeroSurface(CompactShape, Aero.panel, Aero.rimStrong), enabled = nextAvailable)
                 DetailZoomControls(
                     zoom = zoom,
                     zoomOut = { updateZoom(nextDetailZoom(zoom, -1, zoomStops, maximumZoom)) },
@@ -2552,7 +2572,7 @@ private fun DetailImageArea(
         }
         if (compact && !controlsInHeader) {
             Row(
-                Modifier.fillMaxWidth().height(48.dp).background(Panel).padding(horizontal = 4.dp),
+                Modifier.fillMaxWidth().height(52.dp).aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(top = true).padding(horizontal = 6.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 AppIconButton(ChevronLeft, "Fotografia anterior", { callbacks.navigate(-1) }, enabled = previousAvailable)
@@ -2575,15 +2595,16 @@ private fun DetailZoomControls(
     val percentage = (zoom * 100).roundToInt()
     val label = if (kotlin.math.abs(zoom - pixelZoom) <= pixelZoom * .01f) "1:1" else "$percentage%"
     Surface(
-        modifier = modifier.semantics { contentDescription = "Controles de zoom"; stateDescription = "Zoom atual: $percentage%" },
-        color = Panel.copy(alpha = .90f),
+        modifier = modifier.aeroSurface(CompactShape, Aero.panel, Aero.rimStrong)
+            .semantics { contentDescription = "Controles de zoom"; stateDescription = "Zoom atual: $percentage%" },
+        color = Color.Transparent,
         shape = CompactShape,
-        border = if (compact) null else BorderStroke(1.dp, Hairline),
-        shadowElevation = if (compact) 0.dp else 5.dp,
+        border = null,
+        shadowElevation = 0.dp,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AppIconButton(ZoomOut, "Diminuir zoom", zoomOut, enabled = zoom > MIN_DETAIL_ZOOM + .01f)
-            Box(Modifier.width(62.dp).height(44.dp).semantics { contentDescription = "Zoom atual: $percentage%" }, contentAlignment = Alignment.Center) {
+            Box(Modifier.width(64.dp).height(44.dp).semantics { contentDescription = "Zoom atual: $percentage%" }, contentAlignment = Alignment.Center) {
                 Text(label, color = TextPrimary, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelLarge)
             }
             AppIconButton(ZoomIn, "Aumentar zoom", zoomIn, enabled = zoom < maximumZoom - .01f)
@@ -2601,10 +2622,10 @@ private fun Filmstrip(state: AppState, callbacks: AppCallbacks, background: Colo
     val selectedWithin = (current - start).coerceIn(0, neighbors.lastIndex)
     val filmstripState = rememberLazyListState()
     LaunchedEffect(state.selectedId, selectedWithin) { filmstripState.scrollToItem(selectedWithin) }
-    LazyRow(state = filmstripState, modifier = Modifier.fillMaxWidth().height(74.dp).background(background).padding(horizontal = 7.dp, vertical = 5.dp).semantics { contentDescription = "Faixa de fotografias próximas" }, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+    LazyRow(state = filmstripState, modifier = Modifier.fillMaxWidth().height(78.dp).aeroFill(FlatShape, Aero.window, rim = null).aeroEdgeLine(top = true).padding(horizontal = 8.dp, vertical = 6.dp).semantics { contentDescription = "Faixa de fotografias próximas" }, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
         lazyItems(neighbors, key = { it.id }) { item ->
             val selected = item.id == state.selectedId
-            PhotoImage(item, callbacks, 240, ContentScale.Fit, Modifier.width(96.dp).fillMaxHeight().then(if (selected) Modifier.border(2.dp, Amber) else Modifier).combinedClickable(onClick = { callbacks.dispatch(Action.Select(item.id)) }, onDoubleClick = {}).focusable().semantics { contentDescription = "Filmstrip ${item.displayName}"; this.selected = selected })
+            PhotoImage(item, callbacks, 240, ContentScale.Fit, Modifier.width(96.dp).fillMaxHeight().then(if (selected) Modifier.border(2.dp, Accent) else Modifier).combinedClickable(onClick = { callbacks.dispatch(Action.Select(item.id)) }, onDoubleClick = {}).focusable().semantics { contentDescription = "Filmstrip ${item.displayName}"; this.selected = selected })
         }
     }
 }
@@ -2627,24 +2648,24 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
         scope.launch { auxiliary = runCatching { operation() }.getOrElse { AuxiliaryView(error = it.message ?: "Falha na operação") }; busy = false }
     }
     Column(
-        modifier.background(background).verticalScroll(rememberScrollState()).padding(18.dp)
+        modifier.aeroFill(FlatShape, Aero.panel, rim = null).aeroEdgeLine(start = true).verticalScroll(rememberScrollState()).padding(20.dp)
             .semantics { contentDescription = "Painel de curadoria da fotografia" },
-        verticalArrangement = Arrangement.spacedBy(11.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Text("CURADORIA", color = Amber, fontWeight = FontWeight.Bold, style = ProofAnnotationStyle)
+        Text("CURADORIA", color = Accent, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
         QuickControls(photo, state, callbacks)
         EditorialRatingSlider(photo.editorial.rating, canEditPhoto(state, photo), "Avaliação editorial") { callbacks.mutate(photo, photo.editorial.copy(rating = it)) }
         EditorialLabelSelector(photo.editorial.label, canEditPhoto(state, photo)) { callbacks.mutate(photo, photo.editorial.copy(label = it)) }
         val status = when (photo.writeState) { WriteState.IDLE -> editorialSummary(photo.editorial); WriteState.SAVING -> "Salvando no XMP adjacente"; WriteState.PERSISTED -> "Alterações salvas e verificadas"; WriteState.FAILED -> photo.writeError ?: "Falha ao salvar no XMP" }
-        Row(Modifier.fillMaxWidth().clip(CompactShape).background(Stage).padding(9.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(if (photo.writeState == WriteState.FAILED) Close else Check, null, tint = if (photo.writeState == WriteState.FAILED) Danger else PickGreen, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(6.dp)); Text(status, color = Muted, style = MaterialTheme.typography.labelSmall)
+        Row(Modifier.fillMaxWidth().aeroFill(CompactShape, Aero.well, Aero.wellRim).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(if (photo.writeState == WriteState.FAILED) Close else Check, null, tint = if (photo.writeState == WriteState.FAILED) Danger else Mint, modifier = Modifier.size(15.dp)); Spacer(Modifier.width(6.dp)); Text(status, color = Muted, style = MaterialTheme.typography.labelSmall)
         }
         HorizontalDivider(color = Hairline)
         if (photo.issue != null || photo.writeError != null || photo.metadata.status == MetadataStatus.ERROR || photo.editorial.goodError != null) {
             Column(
                 Modifier.fillMaxWidth().clip(CompactShape).background(Danger.copy(alpha = .10f)).border(1.dp, Danger.copy(alpha = .45f), CompactShape)
-                    .padding(10.dp).semantics { contentDescription = "Problema da fotografia ${photo.displayName}" },
-                verticalArrangement = Arrangement.spacedBy(7.dp),
+                    .padding(12.dp).semantics { contentDescription = "Problema da fotografia ${photo.displayName}" },
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Row(verticalAlignment = Alignment.Top) {
                     Icon(ErrorOutline, null, tint = Danger, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(7.dp))
@@ -2655,19 +2676,19 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
                     onClick = { if (state.remote != null) callbacks.refresh() else callbacks.dispatch(Action.OpenSettings) },
                     enabled = state.remote?.let { !it.loading && it.savingPhotoId == null } ?: true,
                     shape = CompactShape,
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Amber),
-                    border = BorderStroke(1.dp, Amber.copy(alpha = .72f)),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Accent),
+                    border = BorderStroke(1.dp, Accent.copy(alpha = .72f)),
                     modifier = Modifier.heightIn(min = 44.dp),
                 ) { Text(if (state.remote != null) "Recarregar estado do servidor" else "Ir às configurações") }
             }
         }
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(ImageSearch, null, tint = Muted, modifier = Modifier.size(17.dp))
-            Text("METADADOS", color = Amber, fontWeight = FontWeight.Bold, style = ProofAnnotationStyle)
+            Text("METADADOS", color = Accent, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
         }
         MetadataTable(photo, callbacks)
         HorizontalDivider(color = Hairline)
-        Text("PALAVRAS-CHAVE", color = Amber, fontWeight = FontWeight.Bold, style = ProofAnnotationStyle)
+        Text("PALAVRAS-CHAVE", color = Accent, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             photo.editorial.keywords.forEach { word -> InputChip(selected = true, shape = CompactShape, onClick = { callbacks.mutate(photo, photo.editorial.copy(keywords = photo.editorial.keywords - word)) }, enabled = canEditPhoto(state, photo), label = { Text(word) }, trailingIcon = { Icon(Close, null, Modifier.size(14.dp)) }) }
         }
@@ -2695,6 +2716,7 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
                     }
                     .semantics { contentDescription = "Nova palavra-chave" },
             )
+            Spacer(Modifier.width(8.dp))
             AppIconButton(Add, "Adicionar palavra-chave", ::addKeyword, enabled = canAddKeyword)
         }
         keywordError?.let { Text(it, color = Danger, style = MaterialTheme.typography.labelSmall, modifier = Modifier.semantics { contentDescription = "Erro de palavra-chave" }) }
@@ -2706,7 +2728,7 @@ private fun DetailInspector(photo: Photo, state: AppState, callbacks: AppCallbac
         val rafPhoto = photo.rawPath?.substringAfterLast('.', "")?.equals("raf", true) == true
         val recipeLabel = if (rafPhoto) "receitas e HDR" else "receitas Fuji"
         TextButton(onClick = { recipesOpen = !recipesOpen }, shape = CompactShape, modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).semantics { contentDescription = if (recipesOpen) "Ocultar $recipeLabel" else "Mostrar $recipeLabel" }) {
-            Icon(Tune, null, Modifier.size(18.dp)); Spacer(Modifier.width(7.dp)); Text(if (rafPhoto) "Receitas e HDR" else "Receitas Fuji", Modifier.weight(1f)); Icon(if (recipesOpen) ChevronLeft else ChevronRight, null)
+            Icon(Tune, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text(if (rafPhoto) "Receitas e HDR" else "Receitas Fuji", Modifier.weight(1f)); Icon(if (recipesOpen) ChevronLeft else ChevronRight, null)
         }
         if (recipesOpen) {
             FujiPanel(photo, state, auxiliary, busy, ::runAux, callbacks)
@@ -2734,13 +2756,13 @@ private fun MetadataTable(photo: Photo, callbacks: AppCallbacks) = photo.metadat
     }
     rows.forEach { (icon, description, value) ->
         Row(
-            Modifier.fillMaxWidth().heightIn(min = 38.dp).semantics(mergeDescendants = true) { contentDescription = "$description: $value" },
+            Modifier.fillMaxWidth().heightIn(min = 40.dp).semantics(mergeDescendants = true) { contentDescription = "$description: $value" },
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.size(30.dp).clip(CompactShape).background(Stage).border(1.dp, Hairline, CompactShape), contentAlignment = Alignment.Center) {
+            Box(Modifier.size(32.dp).aeroFill(CompactShape, Aero.window, Aero.rimStrong), contentAlignment = Alignment.Center) {
                 Icon(icon, null, tint = Muted, modifier = Modifier.size(17.dp))
             }
-            Spacer(Modifier.width(10.dp))
+            Spacer(Modifier.width(12.dp))
             Text(value, color = TextPrimary, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
     }
@@ -2762,7 +2784,7 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
     LaunchedEffect(Unit) { initialFocusRequester.requestFocus() }
     Box(Modifier.fillMaxSize().onFocusChanged { callbacks.shortcutScopeFocused(it.hasFocus) }, contentAlignment = Alignment.TopCenter) {
         Column(
-            Modifier.fillMaxHeight().widthIn(max = 820.dp).verticalScroll(rememberScrollState()).padding(horizontal = 28.dp, vertical = 24.dp),
+            Modifier.fillMaxHeight().widthIn(max = 820.dp).verticalScroll(rememberScrollState()).padding(horizontal = 32.dp, vertical = 28.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) { AppIconButton(ArrowBack, "Voltar à galeria", { callbacks.dispatch(Action.CloseSettings) }, Modifier.focusRequester(initialFocusRequester)); Spacer(Modifier.width(10.dp)); Text("Configurações", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold) }
@@ -2777,7 +2799,7 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
                 Row(Modifier.fillMaxWidth().heightIn(min = 52.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         Text("Modo somente leitura", fontWeight = FontWeight.SemiBold)
-                        Text(if (readOnlyMode) "Ativado" else "Desativado", color = if (readOnlyMode) Muted else Amber, style = MaterialTheme.typography.bodySmall)
+                        Text(if (readOnlyMode) "Ativado" else "Desativado", color = if (readOnlyMode) Muted else Accent, style = MaterialTheme.typography.bodySmall)
                     }
                     Switch(
                         checked = readOnlyMode,
@@ -2800,7 +2822,7 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
             SettingsCard("SINCRONIZAÇÃO", warning = state.sync.phase == SyncPhase.FAILED) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     val syncIcon = when (state.sync.phase) { SyncPhase.FAILED -> ErrorOutline; SyncPhase.COMPLETE -> Check; else -> RefreshVectorIcon }
-                    val syncTint = when (state.sync.phase) { SyncPhase.FAILED -> Danger; SyncPhase.COMPLETE -> PickGreen; else -> Amber }
+                    val syncTint = when (state.sync.phase) { SyncPhase.FAILED -> Danger; SyncPhase.COMPLETE -> Mint; else -> Accent }
                     Icon(syncIcon, null, tint = syncTint, modifier = Modifier.size(20.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(syncPhaseLabel(state.sync.phase), fontWeight = FontWeight.SemiBold)
@@ -2831,11 +2853,11 @@ private fun SettingsScreen(state: AppState, callbacks: AppCallbacks) {
 
 @Composable
 private fun SettingsCard(title: String, warning: Boolean = false, content: @Composable ColumnScope.() -> Unit) = Column(
-    Modifier.fillMaxWidth().background(if (warning) Danger.copy(alpha = .06f) else Color.Transparent).padding(horizontal = 16.dp, vertical = 10.dp),
-    verticalArrangement = Arrangement.spacedBy(10.dp),
+    Modifier.fillMaxWidth().aeroFill(CompactShape, if (warning) Aero.panel else Aero.card, rim = if (warning) Aero.rimStrong else Aero.rim).padding(horizontal = 18.dp, vertical = 12.dp),
+    verticalArrangement = Arrangement.spacedBy(12.dp),
 ) {
     HorizontalDivider(color = if (warning) Danger.copy(alpha = .55f) else Hairline)
-    Text(title, color = Amber, style = ProofAnnotationStyle, fontWeight = FontWeight.Bold)
+    Text(title, color = Accent, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
     content()
 }
 
@@ -2870,7 +2892,7 @@ private fun StatePanel(icon: ImageVector, title: String, message: String, action
     LaunchedEffect(actionLabel) { if (requestInitialFocus) actionFocusRequester.requestFocus() }
     Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         Column(Modifier.widthIn(max = 440.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box(Modifier.size(58.dp).clip(RoundedCornerShape(7.dp)).background(Raised), contentAlignment = Alignment.Center) { Icon(icon, null, tint = Amber, modifier = Modifier.size(28.dp)) }
+            Box(Modifier.size(58.dp).aeroFill(RoundedCornerShape(9.dp), Aero.card, Aero.rimStrong), contentAlignment = Alignment.Center) { Icon(icon, null, tint = Accent, modifier = Modifier.size(28.dp)) }
             Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
             Text(message, color = Muted, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
             Button(onClick = action, shape = CompactShape, modifier = Modifier.heightIn(min = 44.dp).focusRequester(actionFocusRequester)) { Text(actionLabel) }
@@ -2889,4 +2911,4 @@ private fun EmptyGallery(state: AppState, callbacks: AppCallbacks, requestInitia
 } else {
     StatePanel(ImageSearch, "Nenhum resultado", "Nenhuma fotografia corresponde à busca e aos filtros atuais.", "Limpar busca e filtros", { callbacks.dispatch(Action.SetQuery(Query(sort = state.query.sort))) }, requestInitialFocus)
 }
-@Composable private fun ShortcutHelp(close: () -> Unit) { AlertDialog(onDismissRequest = close, confirmButton = { TextButton(onClick = close, shape = CompactShape) { Text("Fechar") } }, icon = { Icon(HelpOutline, null) }, title = { Text("Atalhos de teclado") }, text = { Text("Galeria: setas navegam, Enter abre o detalhe e Escape fecha painéis.\nDetalhe: setas esquerda e direita navegam; P, U e X alteram flags; 0 a 5 definem avaliação; N, R, Y e G definem rótulos.\nAtalhos são ignorados enquanto um campo de texto está em foco.") }) }
+@Composable private fun ShortcutHelp(close: () -> Unit) { AlertDialog(onDismissRequest = close, containerColor = Aero.ink2, confirmButton = { TextButton(onClick = close, shape = CompactShape) { Text("Fechar") } }, icon = { Icon(HelpOutline, null) }, title = { Text("Atalhos de teclado") }, text = { Text("Galeria: setas navegam, Enter abre o detalhe e Escape fecha painéis.\nDetalhe: setas esquerda e direita navegam; P, U e X alteram flags; 0 a 5 definem avaliação; N, R, Y e G definem rótulos.\nAtalhos são ignorados enquanto um campo de texto está em foco.") }) }

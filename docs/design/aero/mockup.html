@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PhotoTool · Aero</title>
+<style>
+:root{
+  --ink-0:#050a13;
+  --ink-1:#0a1524;
+  --ink-2:#0e1c30;
+  --text:#e9f3ff;
+  --text-2:#a7bcd6;
+  --text-3:#6f88a6;
+  --sky:#8ce0ff;
+  --sky-2:#4bb8f5;
+  --sky-3:#1f7fd6;
+  --mint:#63e6c0;
+  --amber:#ffc46b;
+  --rose:#ff7a8a;
+  --edge:rgba(255,255,255,.16);
+  --edge-top:rgba(255,255,255,.46);
+  --glass-a:linear-gradient(180deg,rgba(255,255,255,.13),rgba(255,255,255,.045) 42%,rgba(255,255,255,.02));
+  --blur:blur(26px) saturate(160%);
+  --shadow:0 20px 60px rgba(0,0,0,.55);
+  --hair:1px solid rgba(255,255,255,.10);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:"Segoe UI Variable","Segoe UI","Fira Sans",Inter,system-ui,sans-serif;
+  font-size:13px;line-height:1.35;color:var(--text);
+  background:var(--ink-0);overflow:hidden;
+  -webkit-font-smoothing:antialiased;
+  font-variant-numeric:tabular-nums;
+}
+.atmosphere{position:fixed;inset:0;
+  background:
+    radial-gradient(1100px 760px at 10% -12%,rgba(96,196,255,.36),transparent 62%),
+    radial-gradient(900px 640px at 94% 6%,rgba(120,240,214,.15),transparent 64%),
+    radial-gradient(1000px 900px at 72% 112%,rgba(56,120,255,.22),transparent 62%),
+    linear-gradient(158deg,#0b1727 0%,#081020 46%,#04080f 100%);
+}
+.atmosphere::after{
+  content:"";position:absolute;inset:-25%;
+  background:linear-gradient(112deg,transparent 33%,rgba(255,255,255,.06) 39.5%,rgba(255,255,255,.012) 45%,transparent 51%);
+}
+.grain{position:fixed;inset:0;opacity:.038;pointer-events:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/></filter><rect width='180' height='180' filter='url(%23n)'/></svg>");
+}
+.shell{position:relative;height:100%;padding:26px}
+.window{position:relative;height:100%;display:grid;grid-template-rows:46px 56px 1fr 30px;
+  border-radius:15px;overflow:hidden;
+  background:linear-gradient(180deg,rgba(18,29,46,.70),rgba(7,13,24,.86));
+  border:1px solid var(--edge);border-top-color:var(--edge-top);
+  box-shadow:0 46px 120px rgba(0,0,0,.68),inset 0 1px 0 rgba(255,255,255,.30),0 0 0 1px rgba(0,0,0,.55);
+  backdrop-filter:var(--blur);
+}
+/* ---------- title bar ---------- */
+.titlebar{display:flex;align-items:center;gap:12px;padding:0 10px 0 14px;
+  border-bottom:var(--hair);
+  background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.02));
+}
+.mark{width:24px;height:24px;display:grid;place-items:center;border-radius:7px;
+  background:radial-gradient(circle at 30% 20%,rgba(160,230,255,.42),rgba(30,90,150,.30));
+  border:1px solid rgba(255,255,255,.24);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 0 18px rgba(90,190,255,.28);
+}
+.mark svg{width:15px;height:15px;color:#cdf1ff}
+.appname{font-size:12.5px;font-weight:600;letter-spacing:.22em;text-transform:uppercase}
+.vsep{width:1px;height:18px;background:rgba(255,255,255,.14)}
+.crumb-top{font-size:11.5px;color:var(--text-3);letter-spacing:.02em}
+.crumb-top b{color:var(--text-2);font-weight:500}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.pill{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 11px;border-radius:999px;
+  font-size:11px;letter-spacing:.03em;color:var(--text-2);
+  background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.03));
+  border:1px solid rgba(255,255,255,.14);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28);
+}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--mint);box-shadow:0 0 10px rgba(99,230,192,.9)}
+.dot.amber{background:var(--amber);box-shadow:0 0 10px rgba(255,196,107,.85)}
+.wbtn{width:38px;height:28px;display:grid;place-items:center;border-radius:6px;color:var(--text-2);
+  border:1px solid transparent;transition:background .15s,color .15s,box-shadow .15s}
+.wbtn:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.18);color:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.4),0 0 22px rgba(120,210,255,.30)}
+.wbtn.close:hover{background:linear-gradient(180deg,#ff8f9c,#c8313f);border-color:#ffb3ba;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.5),0 0 26px rgba(255,90,110,.55)}
+.wbtn svg{width:11px;height:11px}
+/* ---------- toolbar ---------- */
+.toolbar{display:flex;align-items:center;gap:10px;padding:0 14px;border-bottom:var(--hair);
+  background:linear-gradient(180deg,rgba(255,255,255,.045),rgba(255,255,255,.012));}
+.nav-btn{width:28px;height:28px;display:grid;place-items:center;border-radius:7px;color:var(--text-2)}
+.nav-btn:hover{background:rgba(255,255,255,.09);color:#fff}
+.nav-btn svg{width:13px;height:13px}
+.trail{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-3)}
+.trail .sep{opacity:.5}
+.trail .here{color:var(--text);font-weight:550}
+.search{display:flex;align-items:center;gap:8px;height:30px;width:280px;padding:0 11px;border-radius:8px;
+  background:linear-gradient(180deg,rgba(0,0,0,.34),rgba(255,255,255,.05));
+  border:1px solid rgba(255,255,255,.13);
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.55),inset 0 -1px 0 rgba(255,255,255,.10);}
+.search svg{width:13px;height:13px;color:var(--text-3)}
+.search span{font-size:12px;color:var(--text-3)}
+.search .kbd{margin-left:auto;font-size:10px;color:var(--text-3);border:1px solid rgba(255,255,255,.16);
+  border-radius:4px;padding:1px 5px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:7px;font-size:11.5px;
+  color:var(--text-2);background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.02));
+  border:1px solid rgba(255,255,255,.13);box-shadow:inset 0 1px 0 rgba(255,255,255,.22)}
+.chip.on{color:#eaf9ff;border-color:rgba(140,224,255,.5);
+  background:linear-gradient(180deg,rgba(120,210,255,.28),rgba(40,120,200,.18));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 0 20px rgba(90,190,255,.28)}
+.chip svg{width:11px;height:11px}
+.segment{display:flex;margin-left:auto;padding:3px;border-radius:9px;gap:2px;
+  background:rgba(0,0,0,.30);border:1px solid rgba(255,255,255,.12);
+  box-shadow:inset 0 1px 3px rgba(0,0,0,.5)}
+.segment button{height:24px;padding:0 12px;border:0;border-radius:6px;font:inherit;font-size:11.5px;
+  color:var(--text-2);background:transparent}
+.segment button.on{color:#04121f;font-weight:600;
+  background:linear-gradient(180deg,#9fe7ff,#4fb6f2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.75),0 2px 10px rgba(60,160,240,.4)}
+/* ---------- layout ---------- */
+.layout{display:grid;grid-template-columns:96px minmax(0,1fr) 344px;min-height:0}
+/* rail */
+.rail{display:flex;flex-direction:column;align-items:center;gap:8px;padding:14px 0;overflow:hidden;
+  border-right:var(--hair);background:linear-gradient(180deg,rgba(0,0,0,.18),rgba(0,0,0,.34))}
+.thumb{width:62px;height:62px;border-radius:10px;overflow:hidden;position:relative;flex:0 0 auto;
+  border:1px solid rgba(255,255,255,.18);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 6px 16px rgba(0,0,0,.45)}
+.thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.thumb::after{content:"";position:absolute;inset:0;border-radius:inherit;
+  background:linear-gradient(180deg,rgba(255,255,255,.18),transparent 34%)}
+.thumb.sel{border-color:rgba(150,228,255,.9);
+  box-shadow:0 0 0 2px rgba(110,200,255,.40),0 0 26px rgba(90,190,255,.55),inset 0 1px 0 rgba(255,255,255,.4)}
+.thumb .flag{position:absolute;left:6px;bottom:6px;width:7px;height:7px;border-radius:2px;
+  background:var(--mint);box-shadow:0 0 8px rgba(99,230,192,.9)}
+.thumb .flag.rej{background:var(--rose);box-shadow:0 0 8px rgba(255,122,138,.8)}
+.rail .fade{width:100%;height:38px;margin-top:auto;
+  background:linear-gradient(180deg,transparent,rgba(4,8,15,.85))}
+/* stage */
+.stage{position:relative;display:grid;place-items:center;min-height:0;overflow:hidden;
+  background:
+    radial-gradient(70% 60% at 50% 42%,rgba(120,200,255,.10),transparent 70%),
+    linear-gradient(180deg,#060d18,#04080f);
+}
+.photoframe{position:relative;z-index:1;height:100%;display:grid;place-items:center;padding:22px 30px}
+.photoframe img{max-height:100%;max-width:100%;border-radius:10px;display:block;
+  filter:drop-shadow(0 0 70px rgba(80,180,255,.20));
+  box-shadow:0 30px 70px rgba(0,0,0,.7),0 0 0 1px rgba(255,255,255,.16),inset 0 1px 0 rgba(255,255,255,.2)}
+.stage-top{position:absolute;z-index:3;top:14px;left:16px;display:flex;gap:8px;flex-wrap:wrap}
+.hud{position:absolute;z-index:3;display:flex;align-items:center;gap:6px;padding:5px;border-radius:11px;
+  background:linear-gradient(180deg,rgba(255,255,255,.20),rgba(24,38,58,.46) 38%,rgba(8,14,24,.56));
+  border:1px solid rgba(255,255,255,.22);border-top-color:rgba(255,255,255,.55);
+  box-shadow:0 16px 40px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.38);
+  backdrop-filter:blur(20px) saturate(170%)}
+.hud-zoom{bottom:16px;left:16px}
+.hud-meta{bottom:16px;right:16px;font-size:11px;color:var(--text-2);padding:8px 11px}
+.hud button{width:28px;height:26px;border:0;border-radius:7px;background:transparent;color:var(--text-2);
+  display:grid;place-items:center}
+.hud button:hover{background:rgba(255,255,255,.12);color:#fff}
+.hud .value{min-width:52px;text-align:center;font-size:12px;color:#eaf8ff;letter-spacing:.02em}
+.hud .stop{width:auto;height:26px;padding:0 10px;border-radius:7px;font-size:11px;color:#d7e7f7;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14)}
+.hud .stop:hover{background:rgba(255,255,255,.16);color:#fff}
+.hud .stop.on{color:#04121f;font-weight:600;background:linear-gradient(180deg,#9fe7ff,#4fb6f2);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.7),0 0 16px rgba(80,180,255,.45)}
+.gchip{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px;border-radius:8px;
+  font-size:11px;color:#c6d8ea;
+  background:linear-gradient(180deg,rgba(255,255,255,.18),rgba(24,38,58,.44) 40%,rgba(8,14,24,.54));
+  border:1px solid rgba(255,255,255,.20);box-shadow:inset 0 1px 0 rgba(255,255,255,.36),0 10px 26px rgba(0,0,0,.35);
+  backdrop-filter:blur(18px) saturate(160%)}
+.gchip b{color:var(--text);font-weight:550}
+/* inspector */
+.inspector{position:relative;z-index:2;display:flex;flex-direction:column;min-height:0;overflow:auto;
+  border-left:var(--hair);
+  background:linear-gradient(180deg,rgba(20,32,50,.62),rgba(8,14,25,.72));
+  backdrop-filter:blur(24px) saturate(150%)}
+.insp-head{padding:18px 18px 14px;border-bottom:var(--hair)}
+.filename{font-size:19px;font-weight:600;letter-spacing:-.01em}
+.submeta{margin-top:4px;font-size:11.5px;color:var(--text-3)}
+.pill-flag{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:999px;
+  font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:#04180f;
+  background:linear-gradient(180deg,#9df5d5,#4ecfa8);box-shadow:0 0 18px rgba(99,230,192,.35)}
+.insp-body{padding:16px 18px;display:flex;flex-direction:column;gap:18px}
+.sec{display:flex;flex-direction:column;gap:9px}
+.sec-title{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--text-3)}
+.stars{display:flex;align-items:center;gap:4px}
+.star{width:24px;height:24px;display:grid;place-items:center;color:rgba(255,255,255,.18);background:none;border:0}
+.star svg{width:19px;height:19px;fill:currentColor}
+.star.on{color:var(--sky);filter:drop-shadow(0 0 7px rgba(120,214,255,.75))}
+.star:hover{color:#bfeeff}
+.rating-num{margin-left:6px;font-size:11.5px;color:var(--text-3)}
+.kws{display:flex;flex-wrap:wrap;gap:6px}
+.kw{display:inline-flex;align-items:center;gap:6px;height:25px;padding:0 9px;border-radius:7px;font-size:11.5px;
+  color:#dceeff;background:linear-gradient(180deg,rgba(140,224,255,.20),rgba(80,150,220,.10));
+  border:1px solid rgba(140,224,255,.30);box-shadow:inset 0 1px 0 rgba(255,255,255,.28)}
+.kw.add{color:var(--text-3);background:transparent;border-style:dashed;border-color:rgba(255,255,255,.20)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:11px 14px}
+.kv dt{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-3)}
+.kv dd{margin-top:2px;font-size:12.5px;color:var(--text)}
+.kv dd small{font-size:10.5px;color:var(--text-3)}
+.plan{border-radius:10px;padding:11px 12px;display:flex;flex-direction:column;gap:8px;
+  background:rgba(0,0,0,.24);border:1px solid rgba(255,255,255,.10);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.10)}
+.plan-row{display:flex;align-items:center;justify-content:space-between;font-size:11.5px;color:var(--text-2)}
+.plan-row b{color:var(--text);font-weight:550}
+.tag{font-size:10px;letter-spacing:.08em;padding:2px 6px;border-radius:5px;color:#cdf1ff;
+  background:rgba(120,210,255,.16);border:1px solid rgba(140,224,255,.30)}
+.insp-foot{margin-top:auto;padding:14px 18px 16px;border-top:var(--hair);display:flex;flex-direction:column;gap:9px}
+.btn{height:34px;border-radius:8px;border:1px solid rgba(255,255,255,.16);font:inherit;font-size:12.5px;
+  display:flex;align-items:center;justify-content:center;gap:8px;color:var(--text);
+  background:linear-gradient(180deg,rgba(255,255,255,.14),rgba(255,255,255,.05));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.42),0 8px 20px rgba(0,0,0,.35)}
+.btn:hover{background:linear-gradient(180deg,rgba(255,255,255,.22),rgba(255,255,255,.08))}
+.btn.primary{border-color:rgba(160,230,255,.55);color:#04121f;font-weight:650;
+  background:linear-gradient(180deg,#a8ebff,#4fb6f2 58%,#2a8fdd);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.85),0 0 0 1px rgba(120,210,255,.35),0 12px 28px rgba(40,150,255,.38)}
+.btn.primary:hover{filter:brightness(1.06);box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 0 28px rgba(110,205,255,.55)}
+.btn svg{width:14px;height:14px}
+.readonly-line{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--text-3)}
+/* status */
+.statusbar{display:flex;align-items:center;gap:14px;padding:0 14px;border-top:var(--hair);
+  font-size:10.5px;letter-spacing:.03em;color:var(--text-3);
+  background:linear-gradient(180deg,rgba(0,0,0,.34),rgba(0,0,0,.48))}
+.statusbar b{color:var(--text-2);font-weight:500}
+.statusbar .right{margin-left:auto;display:flex;gap:14px}
+.sdot{display:inline-flex;align-items:center;gap:6px}
+/* mobile */
+.mobile-only{display:none}
+@media (max-width:620px){
+  .shell{padding:0}
+  .window{border-radius:0;border:0;grid-template-rows:52px 1fr;box-shadow:none}
+  .titlebar{height:52px;padding:0 8px 0 10px}
+  .appname{letter-spacing:.16em;font-size:11.5px}
+  .titlebar{gap:8px}
+  .tb-right{gap:4px}
+  .crumb-top,.vsep,.tb-right .pill,.wbtn:not(.kebab),.toolbar,.rail,.statusbar{display:none}
+  .mobile-only{display:inline-grid}
+  .layout{grid-template-columns:1fr}
+  .stage{place-items:start center}
+  .photoframe{padding:8px 0 0}
+  .photoframe img{max-height:100%;border-radius:0;box-shadow:none}
+  .hud{border-radius:12px}
+  .hud-zoom{top:10px;left:10px;bottom:auto}
+  .hud-meta{display:none}
+  .stage-top{top:56px;bottom:auto;left:12px;gap:6px}
+  .inspector{position:absolute;z-index:4;left:0;right:0;bottom:0;height:46%;border-left:0;
+    border-top:1px solid rgba(255,255,255,.22);border-radius:18px 18px 0 0;
+    background:linear-gradient(180deg,rgba(22,36,56,.86),rgba(8,14,25,.94));
+    backdrop-filter:blur(28px) saturate(160%);
+    box-shadow:0 -20px 60px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.35)}
+  .inspector::before{content:"";position:absolute;top:7px;left:50%;transform:translateX(-50%);
+    width:38px;height:4px;border-radius:99px;background:rgba(255,255,255,.28)}
+  .insp-head{padding:20px 16px 10px;border-bottom:0}
+  .filename{font-size:16px}
+  .insp-body{padding:4px 16px 12px;gap:12px}
+  .insp-body .sec:nth-of-type(3),.insp-body .sec:nth-of-type(4){display:none}
+  .insp-foot{padding:10px 16px 14px;flex-direction:row;border-top:0}
+  .insp-foot .btn{flex:1;height:38px}
+  .insp-foot .btn.ghost,.readonly-line{display:none}
+  .grid2{gap:8px 12px}
+}
+</style>
+</head>
+<body>
+<div class="atmosphere"></div>
+<div class="grain"></div>
+<div class="shell">
+  <div class="window" role="application" aria-label="PhotoTool">
+
+    <header class="titlebar">
+      <button class="nav-btn mobile-only" aria-label="Voltar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M10 3L5 8l5 5"/></svg></button>
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+          <circle cx="12" cy="12" r="8.4"/><path d="M12 3.6v6M20.4 12h-6M12 20.4v-6M3.6 12h6"/>
+          <circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/>
+        </svg>
+      </span>
+      <span class="appname">PhotoTool</span>
+      <span class="vsep"></span>
+      <span class="crumb-top">Acervo · <b>25.114 fotos</b> · 2026.07</span>
+      <div class="tb-right">
+        <span class="pill"><i class="dot"></i>snapshot 5cd8c449</span>
+        <span class="pill"><i class="dot amber"></i>somente leitura</span>
+        <button class="wbtn" aria-label="Minimizar"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.3"><path d="M2 5h6"/></svg></button>
+        <button class="wbtn" aria-label="Maximizar"><svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2" y="2" width="6" height="6"/></svg></button>
+        <button class="wbtn kebab mobile-only" aria-label="Mais"><svg viewBox="0 0 10 10" fill="currentColor"><circle cx="5" cy="2" r="1"/><circle cx="5" cy="5" r="1"/><circle cx="5" cy="8" r="1"/></svg></button>
+        <button class="wbtn close" aria-label="Fechar"><svg viewBox="0 0 10 10" stroke="currentColor" stroke-width="1.4"><path d="M2.4 2.4l5.2 5.2M7.6 2.4L2.4 7.6"/></svg></button>
+      </div>
+    </header>
+
+    <div class="toolbar">
+      <button class="nav-btn" aria-label="Voltar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M10 3L5 8l5 5"/></svg></button>
+      <button class="nav-btn" aria-label="Avançar"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 3l5 5-5 5"/></svg></button>
+      <span class="trail"><span>2026.07</span><span class="sep">/</span><span class="here">_DSF6126.RAF</span></span>
+      <div class="search">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4L14 14"/></svg>
+        <span>palavra-chave, câmera, pasta</span><span class="kbd">/</span>
+      </div>
+      <span class="chip on"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.8l1.9 4.1 4.3.5-3.2 3 .9 4.3L8 11.6 4.1 13.7l.9-4.3-3.2-3 4.3-.5z"/></svg>≥ 1</span>
+      <span class="chip"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 2h8v12l-4-3-4 3z"/></svg>PICK</span>
+      <div class="segment">
+        <button>Grade</button>
+        <button class="on">Detalhe</button>
+      </div>
+    </div>
+
+    <main class="layout">
+      <nav class="rail" aria-label="Filme">
+        <div class="thumb sel"><img src="photo.jpg" alt=""><i class="flag"></i></div>
+        <div class="thumb"><img src="t-9302b07cf288f1e7ae30c2ce.jpg" alt=""></div>
+        <div class="thumb"><img src="t-b27a1dab2f3c72b549f7fba4.jpg" alt=""><i class="flag"></i></div>
+        <div class="thumb"><img src="t-4b2021f672d7ec5d37861a9b.jpg" alt=""><i class="flag rej"></i></div>
+        <div class="thumb"><img src="t-a5d3ec21ed7ff6ade77c0819.jpg" alt=""></div>
+        <div class="fade"></div>
+      </nav>
+
+      <section class="stage">
+        <div class="stage-top">
+          <span class="gchip">RAF + JPEG · <b>6000 × 4000</b></span>
+          <span class="gchip">14 jul 2026 · <b>17:42</b></span>
+        </div>
+
+        <figure class="photoframe">
+          <img src="photo.jpg" alt="Fotografia em detalhe">
+        </figure>
+
+        <div class="hud hud-zoom">
+          <button aria-label="Menos zoom"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.5"><path d="M2.5 6h7"/></svg></button>
+          <span class="value">400%</span>
+          <button aria-label="Mais zoom"><svg viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.5"><path d="M6 2.5v7M2.5 6h7"/></svg></button>
+          <span class="value" style="min-width:0;padding:0 4px;color:#7f97b4">·</span>
+          <button class="stop on">1:1</button>
+          <button class="stop">Pixel</button>
+        </div>
+
+        <div class="hud hud-meta">
+          <span><b>2</b> regiões · 2009 × 1493 · <b>0</b> ms</span>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <div class="insp-head">
+          <div class="filename">_DSF6126.RAF</div>
+          <div class="submeta">Fujifilm X-T5 · XF 23mm f/1.4 · 2026.07</div>
+        </div>
+
+        <div class="insp-body">
+          <div class="sec">
+            <div class="sec-title">Avaliação</div>
+            <div class="stars" role="radiogroup" aria-label="Estrelas">
+              <button class="star on"><svg viewBox="0 0 24 24"><path d="M12 2.6l2.9 6.2 6.6.8-4.9 4.5 1.3 6.5L12 17.4 6.1 20.6l1.3-6.5L2.5 9.6l6.6-.8z"/></svg></button>
+              <button class="star on"><svg viewBox="0 0 24 24"><path d="M12 2.6l2.9 6.2 6.6.8-4.9 4.5 1.3 6.5L12 17.4 6.1 20.6l1.3-6.5L2.5 9.6l6.6-.8z"/></svg></button>
+              <button class="star on"><svg viewBox="0 0 24 24"><path d="M12 2.6l2.9 6.2 6.6.8-4.9 4.5 1.3 6.5L12 17.4 6.1 20.6l1.3-6.5L2.5 9.6l6.6-.8z"/></svg></button>
+              <button class="star on"><svg viewBox="0 0 24 24"><path d="M12 2.6l2.9 6.2 6.6.8-4.9 4.5 1.3 6.5L12 17.4 6.1 20.6l1.3-6.5L2.5 9.6l6.6-.8z"/></svg></button>
+              <button class="star"><svg viewBox="0 0 24 24"><path d="M12 2.6l2.9 6.2 6.6.8-4.9 4.5 1.3 6.5L12 17.4 6.1 20.6l1.3-6.5L2.5 9.6l6.6-.8z"/></svg></button>
+              <span class="rating-num">4</span>
+              <span class="pill-flag" style="margin-left:auto">pick</span>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-title">Palavras-chave</div>
+            <div class="kws">
+              <span class="kw">litoral</span>
+              <span class="kw">neblina</span>
+              <span class="kw">longa exposição</span>
+              <span class="kw">2026.07</span>
+              <span class="kw add">+ adicionar</span>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-title">Captura</div>
+            <div class="grid2">
+              <span class="kv"><dt>ISO</dt><dd>160</dd></span>
+              <span class="kv"><dt>Abertura</dt><dd>f/2.8</dd></span>
+              <span class="kv"><dt>Velocidade</dt><dd>1/250 s</dd></span>
+              <span class="kv"><dt>Distância focal</dt><dd>23 mm <small>· 35 mm</small></dd></span>
+              <span class="kv"><dt>Dimensões</dt><dd>6000 × 4000</dd></span>
+              <span class="kv"><dt>Formato</dt><dd>RAF + JPEG</dd></span>
+            </div>
+          </div>
+
+          <div class="sec">
+            <div class="sec-title">Representação</div>
+            <div class="plan">
+              <div class="plan-row"><span>Prévia</span><b>1600 px</b><span class="tag">PAIRED_JPEG</span></div>
+              <div class="plan-row"><span>Região</span><b>2048 px · 4 Mpx</b><span class="tag">por tile</span></div>
+              <div class="plan-row"><span>Original</span><b>6000 × 4000</b><span class="tag">1:1</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="insp-foot">
+          <button class="btn primary">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 8.5l3.2 3.2L13 5"/></svg>
+            Salvar alterações
+          </button>
+          <button class="btn">Sincronizar acervo</button>
+          <div class="readonly-line"><i class="dot amber" style="width:5px;height:5px"></i>Somente leitura neste cliente. Escreva pelo desktop.</div>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="statusbar">
+      <span><b>5cd8c449</b> · READY</span>
+      <span><i class="sdot"><i class="dot" style="width:5px;height:5px"></i>sync IDLE</i></span>
+      <span>erros <b>0</b></span>
+      <span>projeção <b>25.114</b></span>
+      <span>regiões <b>2</b></span>
+      <span class="right"><span>100.68.177.12:8894</span><span>Aero 1.0 · rascunho</span></span>
+    </footer>
+  </div>
+</div>
+
+<script>
+document.querySelectorAll('.star').forEach((s,i,all)=>{
+  s.addEventListener('click',()=>all.forEach((o,j)=>o.classList.toggle('on',j<=i)));
+});
+document.querySelectorAll('.segment button').forEach(b=>{
+  b.addEventListener('click',()=>{document.querySelectorAll('.segment button').forEach(o=>o.classList.remove('on'));b.classList.add('on')});
+});
+</script>
+</body>
+</html>
